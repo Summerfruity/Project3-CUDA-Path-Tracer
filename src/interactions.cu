@@ -44,14 +44,43 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
         + sin(around) * over * perpendicularDirection2;
 }
 
+// Scatter a ray off the surface, depending on the material properties.
 __host__ __device__ void scatterRay(
-    PathSegment & pathSegment,
+    PathSegment & pathSegment, // pass by ref, modify it in place
     glm::vec3 intersect,
     glm::vec3 normal,
     const Material &m,
     thrust::default_random_engine &rng)
 {
     // TODO: implement this.
-    // A basic implementation of pure-diffuse shading will just call the
-    // calculateRandomDirectionInHemisphere defined above.
+    // Now just purely diffuse shading. 
+
+    // flip the normal if the ray is inside the surface
+    if(glm::dot(normal, pathSegment.ray.direction) > 0)
+    {
+        normal = -normal;
+    }
+
+    // if the material is emissive, don't scatter the ray, just return
+    if(m.emittance > 0.0f)
+    {
+        pathSegment.color *= m.color * m.emittance;
+        pathSegment.remainingBounces = 0;
+        return; 
+    }
+
+    // 1. get the new direction
+    glm::vec3 newDirection = calculateRandomDirectionInHemisphere(normal, rng);
+
+    // 2. update the ray's dir
+    pathSegment.ray.direction = glm::normalize(newDirection);
+
+    // 3. update the ray's origin as intersect, need to add an offset in normal direction
+    pathSegment.ray.origin = intersect + EPSILON * normal;
+
+    // 4. color change(Energy decay)
+    pathSegment.color *= m.color;
+
+    // 5. count a bounce
+    pathSegment.remainingBounces--;
 }
