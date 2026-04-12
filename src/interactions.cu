@@ -78,8 +78,8 @@ __host__ __device__ void scatterRay(
     // 3. update the ray's origin as intersect, need to add an offset in normal direction
     pathSegment.ray.origin = intersect + EPSILON * normal;
 
-    // 4. color change(Energy decay)
-    pathSegment.color *= m.color;
+    // 4. Energy decay: update the path throughput by multiplying with the material color (albedo)
+    pathSegment.throughput *= m.color;
 
     // 5. count a bounce
     pathSegment.remainingBounces--;

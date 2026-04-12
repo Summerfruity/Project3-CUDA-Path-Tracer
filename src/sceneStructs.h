@@ -124,8 +124,11 @@ struct PathSegment
     // The ray to trace for this path.
     Ray ray;
 
-    // Path throughput / multiplicative color weight accumulated so far.
+    // final Radiance accumulated along this path so far.
     glm::vec3 color;
+
+    // Throughput is the cumulative product of BSDFs and cosines along the path, used to weight the contribution of this path to the final image.
+    glm::vec3 throughput;
 
     // Index into the output image buffer.
     int pixelIndex;

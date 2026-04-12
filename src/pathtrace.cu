@@ -144,7 +144,8 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         PathSegment& segment = pathSegments[index];
 
         segment.ray.origin = cam.position;
-        segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
+        segment.color = glm::vec3(0.0f, 0.0f, 0.0f); // initial color is black, no contribution to the final image until we start shading
+        segment.throughput = glm::vec3(1.0f, 1.0f, 1.0f); // initial throughput is white, full contribution to the final image until we start shading and updating it based on the materials we interact with
 
         // TODO: implement antialiasing by jittering the ray
         thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, 0);
@@ -280,7 +281,7 @@ __global__ void shadeFakeMaterial(
 
             // If the material indicates that the object was a light, "light" the ray
             if (material.emittance > 0.0f) {
-                pathSegments[idx].color *= (materialColor * material.emittance);
+                pathSegments[idx].color += pathSegments[idx].throughput * (materialColor * material.emittance);
                 pathSegments[idx].remainingBounces = 0; 
             }
             // Otherwise, do some pseudo-lighting computation. This is actually more
