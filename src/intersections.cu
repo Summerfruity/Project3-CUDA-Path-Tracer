@@ -7,17 +7,19 @@ __host__ __device__ float boxIntersectionTest(
     glm::vec3 &normal,
     bool &outside)
 {
-    Ray q;
+    Ray q; // ray in the coordinate system of the box
+
+    // transform the ray into the space of the box
     q.origin    =                multiplyMV(box.inverseTransform, glm::vec4(r.origin   , 1.0f));
     q.direction = glm::normalize(multiplyMV(box.inverseTransform, glm::vec4(r.direction, 0.0f)));
 
     float tmin = -1e38f;
     float tmax = 1e38f;
-    glm::vec3 tmin_n;
-    glm::vec3 tmax_n;
+    glm::vec3 tmin_n; // normal of the plane that gives us tmin
+    glm::vec3 tmax_n; // normal of the plane that gives us tmax
     for (int xyz = 0; xyz < 3; ++xyz)
     {
-        float qdxyz = q.direction[xyz];
+        float qdxyz = q.direction[xyz]; // component of the ray direction in the current axis, which is the normal of the planes we are intersecting with
         /*if (glm::abs(qdxyz) > 0.00001f)*/
         {
             float t1 = (-0.5f - q.origin[xyz]) / qdxyz;

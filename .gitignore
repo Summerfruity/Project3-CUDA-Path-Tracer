@@ -558,3 +558,4 @@ xcuserdata
 *.moved-aside
 *.xcuserstate
 imgui.ini
+*.png
