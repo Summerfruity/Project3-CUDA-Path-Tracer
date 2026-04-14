@@ -1,7 +1,17 @@
 set(headers
+    "common.h"
+    "cpu.h"
+    "naive.h"
+    "efficient.h"
+    "thrust.h"
     )
 
 set(sources
+    "common.cu"
+    "cpu.cu"
+    "naive.cu"
+    "efficient.cu"
+    "thrust.cu"
     )
 
 list(SORT headers)
