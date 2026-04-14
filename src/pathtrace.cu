@@ -301,7 +301,7 @@ __global__ void shadeFakeMaterial(
             // This can be useful for post-processing and image compositing.
         }
         else {
-            pathSegments[idx].color = glm::vec3(0.0f);
+            pathSegments[idx].color += pathSegments[idx].throughput * BACKGROUND_COLOR;
             pathSegments[idx].remainingBounces = 0; // This is also a good time to terminate the ray if you don't have any more bounces left!
         }
     }

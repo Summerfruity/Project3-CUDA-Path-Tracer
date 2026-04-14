@@ -61,26 +61,51 @@ __host__ __device__ void scatterRay(
         normal = -normal;
     }
 
-    // if the material is emissive, don't scatter the ray, just return
-    if(m.emittance > 0.0f)
+    thrust::uniform_real_distribution<float> u01(0, 1);
+    float xi = u01(rng);
+    float pSpec = glm::clamp(m.hasReflective, 0.0f, 1.0f);
+    glm::vec3 outDir;
+
+    if(xi < pSpec)
     {
-        pathSegment.color *= m.color * m.emittance;
-        pathSegment.remainingBounces = 0;
-        return; 
+        // Specular branch: perfect reflection + roughness blur
+        glm::vec3 mirrorDir = glm::normalize(glm::reflect(pathSegment.ray.direction, normal));
+
+        float roughness = glm::clamp(m.specular.exponent, 0.0f, 1.0f);
+        if(roughness > SPECULAR_ROUGHNESS_EPS)
+        {
+            // Glossy reflection: mix the perfect reflection direction with a random direction in the hemisphere
+            glm::vec3 glossyDir = calculateRandomDirectionInHemisphere(mirrorDir, rng);
+            outDir = glm::normalize(glm::mix(mirrorDir, glossyDir, roughness * roughness));
+        }
+        else
+        {
+            outDir = mirrorDir;
+        }
+
+        // Update the path throughput by multiplying with the specular color and the probability of choosing the specular branch
+        float invProb = (pSpec > 0.0f) ? (1.0 / pSpec) : 0.0f;
+        pathSegment.throughput *= m.specular.color * invProb;
+
     }
+    else
+    {
+        // Diffuse branch: sample a random direction in the hemisphere
+        outDir = glm::normalize(calculateRandomDirectionInHemisphere(normal, rng));
 
-    // 1. get the new direction
-    glm::vec3 newDirection = calculateRandomDirectionInHemisphere(normal, rng);
+        float pDiff = 1.0f - pSpec;
+        float invProb = (pDiff > 0.0f) ? (1.0 / pDiff) : 0.0f;
+        pathSegment.throughput *= m.color * invProb;
+    }
+    
 
-    // 2. update the ray's dir
-    pathSegment.ray.direction = glm::normalize(newDirection);
+    // update the ray's dir
+    pathSegment.ray.direction = outDir;
 
-    // 3. update the ray's origin as intersect, need to add an offset in normal direction
-    pathSegment.ray.origin = intersect + EPSILON * normal;
+    // update the ray's origin as intersect, need to add an offset in normal direction
+    float side = glm::dot(outDir, normal) > 0.0f ? 1.0f : -1.0f;
+    pathSegment.ray.origin = intersect + side * EPSILON * normal;
 
-    // 4. Energy decay: update the path throughput by multiplying with the material color (albedo)
-    pathSegment.throughput *= m.color;
-
-    // 5. count a bounce
+    // record a bounce count
     pathSegment.remainingBounces--;
 }

@@ -559,3 +559,5 @@ xcuserdata
 *.xcuserstate
 imgui.ini
 *.png
+.vscode
+INSTRUCTION_CHINESE.md
