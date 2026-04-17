@@ -14,12 +14,11 @@
 #include "utilities.h"
 #include "intersections.h"
 #include "interactions.h"
+#include "efficient.h"
 
-#define ERRORCHECK 1
+#define ERRORCHECK 0
 
-#define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
-#define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
-void checkCUDAErrorFn(const char* msg, const char* file, int line)
+void pathtraceCheckCUDAErrorFn(const char* msg, const char* file, int line)
 {
 #if ERRORCHECK
     cudaDeviceSynchronize();
@@ -40,6 +39,16 @@ void checkCUDAErrorFn(const char* msg, const char* file, int line)
 #endif // _WIN32
     exit(EXIT_FAILURE);
 #endif // ERRORCHECK
+}
+
+static inline const char* pathtraceFilename()
+{
+    return strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__;
+}
+
+static inline void pathtraceCheckCUDA(const char* msg, int line)
+{
+    pathtraceCheckCUDAErrorFn(msg, pathtraceFilename(), line);
 }
 
 __host__ __device__
@@ -81,7 +90,10 @@ static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
-// ...
+static PathSegment* dev_paths_compact = NULL; 
+static int* dev_activeFlags = NULL;
+static int* dev_scanIndices = NULL;
+static int* dev_newNumPaths = NULL;
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -110,8 +122,19 @@ void pathtraceInit(Scene* scene)
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
     // TODO: initialize any extra device memeory you need
+    cudaMalloc(&dev_paths_compact, pixelcount * sizeof(PathSegment));
 
-    checkCUDAError("pathtraceInit");
+    cudaMalloc(&dev_activeFlags, pixelcount * sizeof(int));
+    cudaMemset(dev_activeFlags, 0, pixelcount * sizeof(int));
+
+    cudaMalloc(&dev_scanIndices, pixelcount * sizeof(int));
+    cudaMemset(dev_scanIndices, 0, pixelcount * sizeof(int));
+
+    cudaMalloc(&dev_newNumPaths, sizeof(int));
+
+    StreamCompaction::Efficient::initScanDeviceBuffer(pixelcount);
+
+    pathtraceCheckCUDA("pathtraceInit", __LINE__);
 }
 
 void pathtraceFree()
@@ -122,9 +145,90 @@ void pathtraceFree()
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
     // TODO: clean up any extra device memory you created
-
-    checkCUDAError("pathtraceFree");
+    cudaFree(dev_paths_compact);
+    cudaFree(dev_activeFlags);
+    cudaFree(dev_scanIndices);
+    cudaFree(dev_newNumPaths);
+    StreamCompaction::Efficient::freeScanDeviceBuffer();
+    pathtraceCheckCUDA("pathtraceFree", __LINE__);
 }
+
+/**
+ * computeActivePathCount is a helper kernel to compute the number of active paths (remainingBounces > 0)
+ */
+__global__ void computeActivePathCount(int n, const int* scanIndices, const int* activeFlags, int* outCount)
+{
+    // compute the number of active paths by looking at the last element of scanIndices and activeFlags
+
+    if(threadIdx.x == 0 && blockIdx.x == 0) // only need one thread to do this
+    {
+        if(n <= 0) // no paths, so count is 0 
+        {
+            outCount[0] = 0;
+            return;
+        }
+        int lastScan = scanIndices[n - 1];
+        int lastFlag = activeFlags[n - 1];
+        outCount[0] = lastScan + lastFlag; // number of active paths is the last scan index + the last flag (if the last path is active)
+    }
+}
+
+
+/**
+ * mapActivePaths is a helper kernel to identify which paths are still active (remainingBounces > 0) 
+ * and set a flag for them in an array. 
+ * This can be used for stream compaction 
+ * to remove terminated paths from the pathSegments array.
+ */
+__global__ void mapActivePaths(int num_paths, PathSegment* pathSegments, int* activeFlags)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < num_paths)
+    {
+        activeFlags[idx] = (pathSegments[idx].remainingBounces > 0) ? 1 : 0;
+    }
+}
+
+/**
+ * scatterActivePaths is a helper kernel to compact the pathSegments array by scattering only the active paths (remainingBounces > 0) 
+ * to a new array based on the scan indices computed from the activeFlags array.
+ */
+__global__ void scatterActivePaths(int num_paths, PathSegment* pathSegments, int* activeFlags, int* scanIndices, PathSegment* compactedPaths)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < num_paths)
+    {
+        if(activeFlags[idx] == 1) 
+        {
+            int compactedIndex = scanIndices[idx];
+            compactedPaths[compactedIndex] = pathSegments[idx];
+        }
+    }
+}
+
+
+/**
+ * gatherTerminatedToImage is a helper kernel to add the color contributions of terminated paths (remainingBounces <= 0) 
+ * to the final image and reset their color to black. 
+ * This should be called before stream compaction to ensure that we don't lose the contributions of terminated paths.
+ */
+__global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegment* Paths)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index < nPaths)
+    {
+        if(Paths[index].remainingBounces <= 0) 
+        {
+            image[Paths[index].pixelIndex] += Paths[index].color;
+            Paths[index].color = glm::vec3(0.0f, 0.0f, 0.0f); // reset color after gathering to image
+        }
+
+    }
+}
+
+
+
+
 
 /**
 * Generate PathSegments with rays from the camera through the screen into the
@@ -370,7 +474,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // TODO: perform one iteration of path tracing
 
     generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, guiData->enableAntialiasing);
-    checkCUDAError("generate camera ray");
+    pathtraceCheckCUDA("generate camera ray", __LINE__);
 
     int depth = 0; // depth is how many times the ray has bounced, not to be confused with iter, which is how many paths have been traced
     PathSegment* dev_path_end = dev_paths + pixelcount; // end of the path segments array, used for stream compaction
@@ -383,7 +487,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     while (!iterationComplete)
     {
         // clean shading chunks
-        cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+        cudaMemset(dev_intersections, 0, num_paths * sizeof(ShadeableIntersection));
 
         // tracing
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d; // number of blocks for tracing path segments, depends on the number of active paths
@@ -395,8 +499,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             hst_scene->geoms.size(),
             dev_intersections
         );
-        checkCUDAError("trace one bounce");
-        cudaDeviceSynchronize();
+        pathtraceCheckCUDA("trace one bounce", __LINE__);
         depth++;
 
         // TODO:
@@ -415,6 +518,32 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_materials
         );
+
+        // gather terminated paths to add their contribution to the image and reset their color to black before compaction
+        gatherTerminatedToImage<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_image, dev_paths);
+        pathtraceCheckCUDA("shade one bounce", __LINE__);
+
+        mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
+        pathtraceCheckCUDA("map active paths", __LINE__);
+
+        StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
+
+        computeActivePathCount<<<1, 1>>>(num_paths, dev_scanIndices, dev_activeFlags, dev_newNumPaths);
+
+        int newNumPaths = 0;
+        cudaMemcpy(&newNumPaths, dev_newNumPaths, sizeof(int), cudaMemcpyDeviceToHost);
+
+        // scatter active paths to compact the path segments array based on the scan indices computed from the active flags
+        scatterActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags, dev_scanIndices, dev_paths_compact);
+        pathtraceCheckCUDA("scatter active paths", __LINE__);
+
+        // swap pointers for compacted paths and path segments
+        PathSegment* temp = dev_paths;
+        dev_paths = dev_paths_compact;
+        dev_paths_compact = temp;
+        num_paths = newNumPaths; // update number of active paths for next iteration
+
+        //std::cout << "Depth: " << depth << ", Paths Remaining: " << num_paths << std::endl;
 
         if(depth >= traceDepth || num_paths <= 0)
             iterationComplete = true; 
@@ -438,5 +567,5 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     cudaMemcpy(hst_scene->state.image.data(), dev_image,
         pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
 
-    checkCUDAError("pathtrace");
+    pathtraceCheckCUDA("pathtrace", __LINE__);
 }

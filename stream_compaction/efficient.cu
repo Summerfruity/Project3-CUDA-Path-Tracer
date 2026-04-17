@@ -14,6 +14,8 @@ namespace StreamCompaction {
             return timer;
         }
 
+        static int* dev_scanScratch = nullptr; // temporary array used for scan operations (length N, where N is the next power of two of the input size)
+        static int scanScratchSize = 0; // the size of dev_scanScratch (length N)
         
         /**
          * Up-sweep phase of the scan operation. Builds a sum in place up the tree.
@@ -105,6 +107,103 @@ namespace StreamCompaction {
             cudaMemcpy(odata, dev_data, n*sizeof(int), cudaMemcpyDeviceToHost);
             cudaFree(dev_data);
         }
+
+        /**
+         * If the scan operation needs more space, this function will allocate it.
+         * If the scan operation needs less space, this function will free the extra space.
+         * After calling this function, dev_scanScratch will point to a device array of length at least maxN, and scanScratchSize will be the size of that array.
+         @param maxN The minimum size of the scan scratch space needed.
+         */
+        void initScanDeviceBuffer(int maxN) {
+
+            if(maxN <= 0) {
+                return;
+            }
+
+
+            int N = 1 << ilog2ceil(maxN); // next power of two of maxN
+            if(scanScratchSize < N) {
+                // Need more space. Free the old buffer and allocate a new one.
+                if(dev_scanScratch != nullptr) {
+                    cudaFree(dev_scanScratch);
+                }
+
+                cudaMalloc((void**)&dev_scanScratch, N * sizeof(int));
+
+                // update the size variable
+                scanScratchSize = N;
+            }
+
+        }
+
+        /**
+         * Frees the scan device buffer if it exists. 
+         * After calling this function, dev_scanScratch will be nullptr and scanScratchSize will be 0.
+         * 
+         */
+        void freeScanDeviceBuffer() {
+            if(dev_scanScratch != nullptr) {
+                cudaFree(dev_scanScratch);
+                dev_scanScratch = nullptr;
+                scanScratchSize = 0;
+            }
+        }
+
+        /**
+         * Performs prefix-sum (aka scan) on idata, storing the result into odata.
+         */
+        void scanDevice(int n, int *dev_odata, const int *dev_idata) {
+
+            if (n <= 0) {
+                return;
+            }
+
+            // Work-efficient scan operates over a power-of-two-sized array.
+            // For non-power-of-two n, pad to the next power of two with zeroes.
+            int logN = ilog2ceil(n);
+            int N = 1 << logN;
+
+            if(N > scanScratchSize) {
+                // Need more space
+                freeScanDeviceBuffer();
+                initScanDeviceBuffer(N);
+            }
+
+            cudaMemcpy(dev_scanScratch, dev_idata, n * sizeof(int), cudaMemcpyDeviceToDevice);
+            if (N > n) {
+                cudaMemset(dev_scanScratch + n, 0, (N - n) * sizeof(int));
+            }
+            
+
+            // upSweep in each depth
+            for (int d = 0; d < logN; d++) {
+                int stride = 1 << (d + 1); // 2^(d+1)
+                int numThreads = N / stride; // number of threads needed at this depth
+                int numBlocks = (numThreads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+                kernUpSweep<<<numBlocks, BLOCK_SIZE>>>(N, d, dev_scanScratch);
+                checkCUDAError("kernUpSweep");
+            }
+
+            // set the last element to 0 before downSweep
+            cudaMemset(dev_scanScratch + N - 1, 0, sizeof(int));
+            // downSweep in each depth
+            for (int d = logN - 1; d >= 0; d--) {
+                int stride = 1 << (d + 1); // 2^(d+1)
+                int numThreads = N / stride; // number of threads needed at this depth
+                int numBlocks = (numThreads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+                kernDownSweep<<<numBlocks, BLOCK_SIZE>>>(N, d, dev_scanScratch);
+                checkCUDAError("kernDownSweep");
+            }
+
+
+            // copy n (not N) results to host side
+            cudaMemcpy(dev_odata, dev_scanScratch, n*sizeof(int), cudaMemcpyDeviceToDevice);
+    
+        }
+
+
 
         /**
          * Performs stream compaction on idata, storing the result into odata.
