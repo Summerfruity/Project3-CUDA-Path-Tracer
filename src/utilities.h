@@ -21,6 +21,10 @@ class GuiDataContainer
 public:
     GuiDataContainer() : TracedDepth(0) {}
     int TracedDepth;
+    bool enableStreamCompaction = true;
+    bool enableAdaptiveCompaction = true;
+    float compactionActiveRatioThreshold = 0.70f;
+    int compactionMinPaths = 4096;
     bool enableAntialiasing = true;
 };
 

@@ -16,7 +16,11 @@
 #include "interactions.h"
 #include "efficient.h"
 
+#if defined(NDEBUG)
 #define ERRORCHECK 0
+#else
+#define ERRORCHECK 1
+#endif
 
 void pathtraceCheckCUDAErrorFn(const char* msg, const char* file, int line)
 {
@@ -442,6 +446,11 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // 1D block for path tracing
     const int blockSize1d = 128;
 
+    const bool ENABLE_STREAM_COMPACTION = (guiData != NULL) ? guiData->enableStreamCompaction : true;
+    const bool ENABLE_ADAPTIVE_COMPACTION = (guiData != NULL) ? guiData->enableAdaptiveCompaction : true;
+    const float COMPACTION_ACTIVE_RATIO_THRESHOLD = (guiData != NULL) ? guiData->compactionActiveRatioThreshold : 0.70f;
+    const int COMPACTION_MIN_PATHS = (guiData != NULL) ? guiData->compactionMinPaths : 4096;
+
     ///////////////////////////////////////////////////////////////////////////
 
     // Recap:
@@ -523,25 +532,46 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         gatherTerminatedToImage<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_image, dev_paths);
         pathtraceCheckCUDA("shade one bounce", __LINE__);
 
-        mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
-        pathtraceCheckCUDA("map active paths", __LINE__);
+        if (ENABLE_STREAM_COMPACTION)
+        {
+            mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
+            pathtraceCheckCUDA("map active paths", __LINE__);
 
-        StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
+            StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
 
-        computeActivePathCount<<<1, 1>>>(num_paths, dev_scanIndices, dev_activeFlags, dev_newNumPaths);
+            computeActivePathCount<<<1, 1>>>(num_paths, dev_scanIndices, dev_activeFlags, dev_newNumPaths);
 
-        int newNumPaths = 0;
-        cudaMemcpy(&newNumPaths, dev_newNumPaths, sizeof(int), cudaMemcpyDeviceToHost);
+            int newNumPaths = 0;
+            cudaMemcpy(&newNumPaths, dev_newNumPaths, sizeof(int), cudaMemcpyDeviceToHost);
 
-        // scatter active paths to compact the path segments array based on the scan indices computed from the active flags
-        scatterActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags, dev_scanIndices, dev_paths_compact);
-        pathtraceCheckCUDA("scatter active paths", __LINE__);
+            if (newNumPaths == 0)
+            {
+                num_paths = 0;
+            }
+            else
+            {
+                bool shouldCompact = true;
+                if (ENABLE_ADAPTIVE_COMPACTION)
+                {
+                    float activeRatio = (float)newNumPaths / (float)num_paths;
+                    shouldCompact = ((activeRatio <= COMPACTION_ACTIVE_RATIO_THRESHOLD) && num_paths >= COMPACTION_MIN_PATHS);
+                }
 
-        // swap pointers for compacted paths and path segments
-        PathSegment* temp = dev_paths;
-        dev_paths = dev_paths_compact;
-        dev_paths_compact = temp;
-        num_paths = newNumPaths; // update number of active paths for next iteration
+                if (shouldCompact)
+                {
+                    // scatter active paths to compact the path segments array based on the scan indices computed from the active flags
+                    scatterActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags, dev_scanIndices, dev_paths_compact);
+                    pathtraceCheckCUDA("scatter active paths", __LINE__);
+
+                    // swap pointers for compacted paths and path segments
+                    PathSegment* temp = dev_paths;
+                    dev_paths = dev_paths_compact;
+                    dev_paths_compact = temp;
+                    num_paths = newNumPaths; // update number of active paths for next iteration
+                }
+            }
+        }
+
 
         //std::cout << "Depth: " << depth << ", Paths Remaining: " << num_paths << std::endl;
 
@@ -555,9 +585,11 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     }
 
     // Assemble this iteration and apply it to the image
-    dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
-    finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);
-
+    if (num_paths > 0) 
+    {
+        dim3 numBlocksGather = (num_paths + blockSize1d - 1) / blockSize1d;
+        finalGather<<<numBlocksGather, blockSize1d>>>(num_paths, dev_image, dev_paths);
+    }
     ///////////////////////////////////////////////////////////////////////////
 
     // Send results to OpenGL buffer for rendering

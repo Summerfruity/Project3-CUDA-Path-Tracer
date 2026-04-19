@@ -286,9 +286,20 @@ void RenderImGui()
     //ImGui::Text("counter = %d", counter);
     ImGui::Text("Traced Depth %d", imguiData->TracedDepth);
     ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
-    if (ImGui::Checkbox("Enable Antialiasing (Jitter)", &imguiData->enableAntialiasing)) {
+    bool uiChanged = false;
+    uiChanged |= ImGui::Checkbox("Enable Antialiasing (Jitter)", &imguiData->enableAntialiasing);
+    uiChanged |= ImGui::Checkbox("Enable Stream Compaction", &imguiData->enableStreamCompaction);
+    uiChanged |= ImGui::Checkbox("Enable Adaptive Compaction", &imguiData->enableAdaptiveCompaction);
+
+    if (imguiData->enableAdaptiveCompaction) {
+        uiChanged |= ImGui::SliderFloat("Compaction Active Ratio", &imguiData->compactionActiveRatioThreshold, 0.0f, 1.0f, "%.2f");
+        uiChanged |= ImGui::SliderInt("Compaction Min Paths", &imguiData->compactionMinPaths, 0, width * height);
+    }
+
+    if (uiChanged) {
         camchanged = true; 
     }
+    
     ImGui::End();
 
 

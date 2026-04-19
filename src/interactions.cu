@@ -52,8 +52,6 @@ __host__ __device__ void scatterRay(
     const Material &m,
     thrust::default_random_engine &rng)
 {
-    // TODO: implement this.
-    // Now just purely diffuse shading. 
 
     // flip the normal if the ray is inside the surface
     if(glm::dot(normal, pathSegment.ray.direction) > 0)
