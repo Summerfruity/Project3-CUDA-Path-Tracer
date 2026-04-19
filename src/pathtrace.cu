@@ -385,24 +385,24 @@ const Material* materials, int num_paths, int* materialSortKeys)
         return;
 
     const ShadeableIntersection isect = intersections[idx];
+    const int mid = isect.materialId;
+    const Material m = materials[mid];
     
     // Dead paths put in the end
     if(pathSegments[idx].remainingBounces <= 0)
     {
-        materialSortKeys[idx] = (BUCKET_DEAD << 24) | (idx & 0x00FFFFFF); // bucket | idx
+        materialSortKeys[idx] = (BUCKET_DEAD << 24); // bucket | idx
         return;
     }
 
     // Then the missed rays before dead ones
     if(isect.t <= 0.0f || isect.materialId < 0)
     {
-        materialSortKeys[idx] = (BUCKET_MISS << 24) | (idx & 0x00FFFFFF); // bucket | idx
+        materialSortKeys[idx] = (BUCKET_MISS << 24); // bucket | idx
         return;
     }
 
     // rays hit are sorted by material types
-    const int mid = isect.materialId;
-    const Material m = materials[mid];
 
     int bucket = BUCKET_DIFFUSE;
     if(m.emittance > 0.0f)
@@ -414,7 +414,7 @@ const Material* materials, int num_paths, int* materialSortKeys)
         bucket = BUCKET_SPECULAR;
     }
 
-    materialSortKeys[idx] = (bucket << 24) | (idx & 0x00FFFFFF); // bucket | idx
+    materialSortKeys[idx] = (bucket << 24) | (mid & 0x00FFFFFF); // bucket | idx
     
 }
 
