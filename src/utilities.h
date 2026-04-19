@@ -23,6 +23,7 @@ public:
     int TracedDepth;
     bool enableStreamCompaction = true;
     bool enableAdaptiveCompaction = true;
+    bool enableMaterialTypeSort = false;
     float compactionActiveRatioThreshold = 0.70f;
     int compactionMinPaths = 4096;
     bool enableAntialiasing = true;

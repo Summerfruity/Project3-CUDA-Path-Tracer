@@ -290,6 +290,7 @@ void RenderImGui()
     uiChanged |= ImGui::Checkbox("Enable Antialiasing (Jitter)", &imguiData->enableAntialiasing);
     uiChanged |= ImGui::Checkbox("Enable Stream Compaction", &imguiData->enableStreamCompaction);
     uiChanged |= ImGui::Checkbox("Enable Adaptive Compaction", &imguiData->enableAdaptiveCompaction);
+    uiChanged |= ImGui::Checkbox("Enable Material Type Sort", &imguiData->enableMaterialTypeSort);
 
     if (imguiData->enableAdaptiveCompaction) {
         uiChanged |= ImGui::SliderFloat("Compaction Active Ratio", &imguiData->compactionActiveRatioThreshold, 0.0f, 1.0f, "%.2f");

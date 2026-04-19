@@ -6,6 +6,10 @@
 #include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/remove.h>
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -93,11 +97,21 @@ static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
-// TODO: static variables for device memory, any extra info you need, etc
+// static variables for device memory, any extra info you need, etc
 static PathSegment* dev_paths_compact = NULL; 
 static int* dev_activeFlags = NULL;
 static int* dev_scanIndices = NULL;
 static int* dev_newNumPaths = NULL;
+static int* dev_materialSortKeys = NULL;
+
+enum MaterialTypeBucket
+{
+    BUCKET_EMISSIVE = 0,
+    BUCKET_SPECULAR = 1,
+    BUCKET_DIFFUSE  = 2,
+    BUCKET_MISS     = 3,
+    BUCKET_DEAD     = 4
+};
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -125,7 +139,7 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
-    // TODO: initialize any extra device memeory you need
+    // initialize any extra device memeory you need
     cudaMalloc(&dev_paths_compact, pixelcount * sizeof(PathSegment));
 
     cudaMalloc(&dev_activeFlags, pixelcount * sizeof(int));
@@ -135,6 +149,8 @@ void pathtraceInit(Scene* scene)
     cudaMemset(dev_scanIndices, 0, pixelcount * sizeof(int));
 
     cudaMalloc(&dev_newNumPaths, sizeof(int));
+
+    cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
 
     StreamCompaction::Efficient::initScanDeviceBuffer(pixelcount);
 
@@ -153,6 +169,7 @@ void pathtraceFree()
     cudaFree(dev_activeFlags);
     cudaFree(dev_scanIndices);
     cudaFree(dev_newNumPaths);
+    cudaFree(dev_materialSortKeys);
     StreamCompaction::Efficient::freeScanDeviceBuffer();
     pathtraceCheckCUDA("pathtraceFree", __LINE__);
 }
@@ -352,6 +369,58 @@ __global__ void computeIntersections(
     }
 }
 
+
+/**
+ * buildMaterialSortKeys is a helper kernel to build an array of integer keys for sorting path segments by material type.
+ * The keys are constructed such that the higher 8 bits represent the material type bucket 
+ * (emissive, specular, diffuse, miss, dead) and the lower 24 bits represent the original index of the path segment. 
+ * This allows us to sort the path segments by material type while still being able to retrieve the original path segment index after sorting. 
+ * This should be called after computing intersections and before shading to group path segments by material type for better memory coherence during shading
+ */
+__global__ void buildMaterialSortKeys(const PathSegment* pathSegments, const ShadeableIntersection* intersections, 
+const Material* materials, int num_paths, int* materialSortKeys)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= num_paths)
+        return;
+
+    const ShadeableIntersection isect = intersections[idx];
+    
+    // Dead paths put in the end
+    if(pathSegments[idx].remainingBounces <= 0)
+    {
+        materialSortKeys[idx] = (BUCKET_DEAD << 24) | (idx & 0x00FFFFFF); // bucket | idx
+        return;
+    }
+
+    // Then the missed rays before dead ones
+    if(isect.t <= 0.0f || isect.materialId < 0)
+    {
+        materialSortKeys[idx] = (BUCKET_MISS << 24) | (idx & 0x00FFFFFF); // bucket | idx
+        return;
+    }
+
+    // rays hit are sorted by material types
+    const int mid = isect.materialId;
+    const Material m = materials[mid];
+
+    int bucket = BUCKET_DIFFUSE;
+    if(m.emittance > 0.0f)
+    {
+        bucket = BUCKET_EMISSIVE;
+    }
+    else if(m.hasReflective > 0.0f)
+    {
+        bucket = BUCKET_SPECULAR;
+    }
+
+    materialSortKeys[idx] = (bucket << 24) | (idx & 0x00FFFFFF); // bucket | idx
+    
+}
+
+
+
+
 // LOOK: "fake" shader demonstrating what you might do with the info in
 // a ShadeableIntersection, as well as how to use thrust's random number
 // generator. Observe that since the thrust random number generator basically
@@ -446,8 +515,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // 1D block for path tracing
     const int blockSize1d = 128;
 
+    // Set ImGuiDataContainer options
     const bool ENABLE_STREAM_COMPACTION = (guiData != NULL) ? guiData->enableStreamCompaction : true;
     const bool ENABLE_ADAPTIVE_COMPACTION = (guiData != NULL) ? guiData->enableAdaptiveCompaction : true;
+    const bool ENABLE_MATERIAL_TYPE_SORT = (guiData != NULL) ? guiData->enableMaterialTypeSort : false;
     const float COMPACTION_ACTIVE_RATIO_THRESHOLD = (guiData != NULL) ? guiData->compactionActiveRatioThreshold : 0.70f;
     const int COMPACTION_MIN_PATHS = (guiData != NULL) ? guiData->compactionMinPaths : 4096;
 
@@ -511,7 +582,35 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         pathtraceCheckCUDA("trace one bounce", __LINE__);
         depth++;
 
-        // TODO:
+        // --- Material Sort Stage ---
+        // Sort the active path segments by material type only when enabled.
+        if (ENABLE_MATERIAL_TYPE_SORT)
+        {
+            buildMaterialSortKeys<<<numblocksPathSegmentTracing, blockSize1d>>>(
+                dev_paths,
+                dev_intersections,
+                dev_materials,
+                num_paths,
+                dev_materialSortKeys
+            );
+            pathtraceCheckCUDA("build material type sort keys", __LINE__);
+
+            // get the range of keys to sort over based on the number of active paths
+            auto keys_begin = thrust::device_pointer_cast(dev_materialSortKeys);
+            auto keys_end = keys_begin + num_paths;
+
+            // zip the keys with path data so both arrays are reordered together
+            auto values_begin = thrust::make_zip_iterator(thrust::make_tuple(
+                thrust::device_pointer_cast(dev_paths),
+                thrust::device_pointer_cast(dev_intersections)
+            ));
+
+            // sort the path segments and intersections based on material type keys
+            thrust::sort_by_key(thrust::device, keys_begin, keys_end, values_begin);
+            pathtraceCheckCUDA("sort by material type", __LINE__);
+        }
+
+
         // --- Shading Stage ---
         // Shade path segments based on intersections and generate new rays by
         // evaluating the BSDF.
