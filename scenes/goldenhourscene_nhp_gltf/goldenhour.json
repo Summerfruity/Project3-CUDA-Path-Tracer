@@ -1,0 +1,57 @@
+{
+    "Materials":
+    {
+        "light":
+        {
+            "TYPE":"Emitting",
+            "RGB":[1.0, 1.0, 1.0],
+            "EMITTANCE":8.0
+        },
+        "mesh_mat":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.85, 0.85, 0.85]
+        },
+        "ground":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.75, 0.75, 0.78]
+        }
+    },
+    "Camera":
+    {
+        "RES":[1280, 720],
+        "FOVY":45.0,
+        "ITERATIONS":2000,
+        "DEPTH":8,
+        "FILE":"gltf_render",
+        "EYE":[0.0, 3.0, 8.0],
+        "LOOKAT":[0.0, 1.5, 0.0],
+        "UP":[0.0, 1.0, 0.0]
+    },
+    "Objects":
+    [
+        {
+            "TYPE":"cube",
+            "MATERIAL":"ground",
+            "TRANS":[0.0, -0.51, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[12.0, 0.02, 12.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"light",
+            "TRANS":[0.0, 7.0, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[2.0, 0.1, 2.0]
+        },
+        {
+            "TYPE":"gltf",
+            "FILE":"scene.gltf",
+            "MATERIAL":"mesh_mat",
+            "TRANS":[0.0, 0.0, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[1.0, 1.0, 1.0]
+        }
+    ]
+}
