@@ -20,9 +20,9 @@
     },
     "Camera":
     {
-        "RES":[1280, 720],
+        "RES":[800,800],
         "FOVY":45.0,
-        "ITERATIONS":2000,
+        "ITERATIONS":5000,
         "DEPTH":8,
         "FILE":"gltf_render",
         "EYE":[0.0, 3.0, 8.0],
@@ -47,7 +47,7 @@
         },
         {
             "TYPE":"gltf",
-            "FILE":"scene.gltf",
+            "FILE":"mashroom_gltf/untitled.gltf",
             "MATERIAL":"mesh_mat",
             "TRANS":[0.0, 0.0, 0.0],
             "ROTAT":[0.0, 0.0, 0.0],
