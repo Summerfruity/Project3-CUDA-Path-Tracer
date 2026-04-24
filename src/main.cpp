@@ -287,6 +287,7 @@ void RenderImGui()
     ImGui::Text("Traced Depth %d", imguiData->TracedDepth);
     ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
     bool uiChanged = false;
+    uiChanged |= ImGui::Checkbox("Enable Mesh AABB Culling", &imguiData->enableMeshAABBCulling);
     uiChanged |= ImGui::Checkbox("Enable Antialiasing (Jitter)", &imguiData->enableAntialiasing);
     uiChanged |= ImGui::Checkbox("Enable Stream Compaction", &imguiData->enableStreamCompaction);
     uiChanged |= ImGui::Checkbox("Enable Adaptive Compaction", &imguiData->enableAdaptiveCompaction);

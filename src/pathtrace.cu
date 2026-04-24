@@ -319,6 +319,7 @@ __global__ void computeIntersections(
     int triangles_size,
     const MeshRange* meshRanges,
     int meshRanges_size,
+    bool enableMeshAABBCulling,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -371,7 +372,7 @@ __global__ void computeIntersections(
             }
         }
 
-        // Intersect ray with mesh triangles. First cull using each mesh AABB, then test triangles in that range.
+        // Intersect ray with mesh triangles. Optionally cull using each mesh AABB, then test triangles in that range.
         for (int m = 0; m < meshRanges_size; ++m)
         {
             const MeshRange& range = meshRanges[m];
@@ -380,16 +381,19 @@ __global__ void computeIntersections(
                 continue;
             }
 
-            float tEnter = 0.0f;
-            float tExit = 0.0f;
-            if (!aabbIntersectionTest(range.aabbMin, range.aabbMax, pathSegment.ray, tEnter, tExit))
+            if (enableMeshAABBCulling)
             {
-                continue;
-            }
+                float tEnter = 0.0f;
+                float tExit = 0.0f;
+                if (!aabbIntersectionTest(range.aabbMin, range.aabbMax, pathSegment.ray, tEnter, tExit))
+                {
+                    continue;
+                }
 
-            if (tEnter > t_min)
-            {
-                continue;
+                if (tEnter > t_min)
+                {
+                    continue;
+                }
             }
 
             int triStart = range.triStartIndex;
@@ -578,6 +582,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     const bool ENABLE_STREAM_COMPACTION = (guiData != NULL) ? guiData->enableStreamCompaction : true;
     const bool ENABLE_ADAPTIVE_COMPACTION = (guiData != NULL) ? guiData->enableAdaptiveCompaction : true;
     const bool ENABLE_MATERIAL_TYPE_SORT = (guiData != NULL) ? guiData->enableMaterialTypeSort : false;
+    const bool ENABLE_MESH_AABB_CULLING = (guiData != NULL) ? guiData->enableMeshAABBCulling : true;
+    const bool ENABLE_ANTIALIASING = (guiData != NULL) ? guiData->enableAntialiasing : true;
     const float COMPACTION_ACTIVE_RATIO_THRESHOLD = (guiData != NULL) ? guiData->compactionActiveRatioThreshold : 0.70f;
     const int COMPACTION_MIN_PATHS = (guiData != NULL) ? guiData->compactionMinPaths : 4096;
 
@@ -612,7 +618,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     // TODO: perform one iteration of path tracing
 
-    generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, guiData->enableAntialiasing);
+    generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, ENABLE_ANTIALIASING);
     pathtraceCheckCUDA("generate camera ray", __LINE__);
 
     int depth = 0; // depth is how many times the ray has bounced, not to be confused with iter, which is how many paths have been traced
@@ -640,6 +646,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             static_cast<int>(hst_scene->triangles.size()),
             dev_meshRanges,
             static_cast<int>(hst_scene->meshRanges.size()),
+            ENABLE_MESH_AABB_CULLING,
             dev_intersections
         );
         pathtraceCheckCUDA("trace one bounce", __LINE__);
