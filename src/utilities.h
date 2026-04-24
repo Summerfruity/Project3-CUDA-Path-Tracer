@@ -21,6 +21,7 @@ class GuiDataContainer
 public:
     GuiDataContainer() : TracedDepth(0) {}
     int TracedDepth;
+    bool enableMeshAABBCulling = true;
     bool enableStreamCompaction = true;
     bool enableAdaptiveCompaction = true;
     bool enableMaterialTypeSort = false;
