@@ -26,7 +26,7 @@ __host__ __device__ float boxIntersectionTest(
             float t2 = (+0.5f - q.origin[xyz]) / qdxyz;
             float ta = glm::min(t1, t2);
             float tb = glm::max(t1, t2);
-            glm::vec3 n;
+            glm::vec3 n; // normal of the plane we are intersecting with, in the space of the box. We will transform it back to world space at the end.
             n[xyz] = t2 < t1 ? +1 : -1;
             if (ta > 0 && ta > tmin)
             {
@@ -112,4 +112,131 @@ __host__ __device__ float sphereIntersectionTest(
     }
 
     return glm::length(r.origin - intersectionPoint);
+}
+
+
+__host__ __device__ bool aabbIntersectionTest(
+    const glm::vec3& bmin, // (xmin, ymin, zmin)
+    const glm::vec3& bmax, // (xmax, ymax, zmax)
+    const Ray& r,
+    float& tEnter,
+    float& tExit
+)
+{
+
+    const float kInf = 1e38f;
+    const float kEps = 1e-8f;
+
+    float tmin = kEps;
+    float tmax = kInf;
+
+    for(int axis = 0; axis < 3; ++axis)
+    {
+        float origin = r.origin[axis];
+        float dir = r.direction[axis];
+
+        float minv = bmin[axis];
+        float maxv = bmax[axis];
+
+        // if the ray is parallel to axis && origin is not inside the box, return false
+        if(fabsf(dir) < kEps)
+        {
+            if(origin < minv || origin > maxv)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        float t1 = (minv - origin) / dir;
+        float t2 = (maxv - origin) / dir;
+        float ta = fminf(t1, t2);
+        float tb = fmaxf(t1, t2);
+
+        // update tmin and tmax
+        tmin = fmaxf(tmin, ta);
+        tmax = fminf(tmax, tb);
+
+        // if the ray misses the box, return false
+        if (tmax < tmin)
+        {
+            return false;
+        }
+
+    }
+
+    tEnter = tmin;
+    tExit  = tmax;
+
+    return tExit >= 0.0f;
+
+}
+
+__host__ __device__ float triangleIntersectionTest(
+    const Triangle& triangle,
+    const Ray& r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside
+)
+{
+    // Ensure we use a unit direction so returned t is a world-space distance.
+    Ray ray = r;
+    ray.direction = glm::normalize(ray.direction);
+
+    glm::vec3 baryPosition;
+    bool hit = glm::intersectRayTriangle(
+        ray.origin,
+        ray.direction,
+        triangle.v1,
+        triangle.v2,
+        triangle.v3,
+        baryPosition
+    );
+
+    if (!hit)
+    {
+        return -1.0f;
+    }
+
+    // GLM writes (u, v, t) into baryPosition.
+    float t = baryPosition.z;
+    if (t <= 0.0f)
+    {
+        return -1.0f;
+    }
+
+    intersectionPoint = getPointOnRay(ray, t);
+
+    // Compute geometric normal as a fallback.
+    glm::vec3 edge1 = triangle.v2 - triangle.v1;
+    glm::vec3 edge2 = triangle.v3 - triangle.v1;
+    glm::vec3 faceNormal = glm::normalize(glm::cross(edge1, edge2));
+
+    if (triangle.hasVertexNormals != 0)
+    {
+        const float u = baryPosition.x;
+        const float v = baryPosition.y;
+        const float w = 1.0f - u - v;
+
+        glm::vec3 interpNormal = w * triangle.n1 + u * triangle.n2 + v * triangle.n3;
+        if (glm::length2(interpNormal) > 0.0f)
+        {
+            // If the interpolated normal is non-zero, use it. Otherwise, fall back to the face normal.
+            normal = glm::normalize(interpNormal);
+        }
+        else
+        {
+            normal = faceNormal;
+        }
+    }
+    else
+    {
+        normal = faceNormal;
+    }
+
+    outside = glm::dot(ray.direction, normal) < 0.0f;
+
+    return glm::length(ray.origin - intersectionPoint);
+
 }

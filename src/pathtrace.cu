@@ -94,6 +94,8 @@ static Scene* hst_scene = NULL;
 static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
 static Geom* dev_geoms = NULL;
+static Triangle* dev_triangles = NULL;
+static MeshRange* dev_meshRanges = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
@@ -133,6 +135,12 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
     cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
 
+    cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+    cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&dev_meshRanges, scene->meshRanges.size() * sizeof(MeshRange));
+    cudaMemcpy(dev_meshRanges, scene->meshRanges.data(), scene->meshRanges.size() * sizeof(MeshRange), cudaMemcpyHostToDevice);
+
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
@@ -170,6 +178,8 @@ void pathtraceFree()
     cudaFree(dev_scanIndices);
     cudaFree(dev_newNumPaths);
     cudaFree(dev_materialSortKeys);
+    cudaFree(dev_triangles);
+    cudaFree(dev_meshRanges);
     StreamCompaction::Efficient::freeScanDeviceBuffer();
     pathtraceCheckCUDA("pathtraceFree", __LINE__);
 }
@@ -305,6 +315,10 @@ __global__ void computeIntersections(
     PathSegment* pathSegments,
     Geom* geoms,
     int geoms_size,
+    const Triangle* triangles,
+    int triangles_size,
+    const MeshRange* meshRanges,
+    int meshRanges_size,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -318,11 +332,13 @@ __global__ void computeIntersections(
             return;
         }
 
+        (void)depth;
+
         float t; // distance along ray to intersection
         glm::vec3 intersect_point; // point of intersection
         glm::vec3 normal;
         float t_min = FLT_MAX;
-        int hit_geom_index = -1;
+        int hit_material_id = -1;
         bool outside = true; // used to determine whether the intersection was from outside the surface or inside the surface, should be passed to the shader to determine how to shade the intersection
 
         glm::vec3 tmp_intersect; // used if the ray intersects with the current geometry
@@ -349,13 +365,54 @@ __global__ void computeIntersections(
             if (t > 0.0f && t_min > t)
             {
                 t_min = t;
-                hit_geom_index = i;
+                hit_material_id = geom.materialid;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
             }
         }
 
-        if (hit_geom_index == -1)
+        // Intersect ray with mesh triangles. First cull using each mesh AABB, then test triangles in that range.
+        for (int m = 0; m < meshRanges_size; ++m)
+        {
+            const MeshRange& range = meshRanges[m];
+            if (range.triCount <= 0)
+            {
+                continue;
+            }
+
+            float tEnter = 0.0f;
+            float tExit = 0.0f;
+            if (!aabbIntersectionTest(range.aabbMin, range.aabbMax, pathSegment.ray, tEnter, tExit))
+            {
+                continue;
+            }
+
+            if (tEnter > t_min)
+            {
+                continue;
+            }
+
+            int triStart = range.triStartIndex;
+            int triEnd = triStart + range.triCount;
+
+            triStart = triStart < 0 ? 0 : triStart;
+            triEnd = triEnd > triangles_size ? triangles_size : triEnd;
+
+            for (int ti = triStart; ti < triEnd; ++ti)
+            {
+                const Triangle& tri = triangles[ti];
+                t = triangleIntersectionTest(tri, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                if (t > 0.0f && t < t_min)
+                {
+                    t_min = t;
+                    hit_material_id = tri.materialid;
+                    intersect_point = tmp_intersect;
+                    normal = tmp_normal;
+                }
+            }
+        }
+
+        if (hit_material_id < 0)
         {
             intersections[path_index].t = -1.0f;
         }
@@ -363,7 +420,7 @@ __global__ void computeIntersections(
         {
             // The ray hits something
             intersections[path_index].t = t_min;
-            intersections[path_index].materialId = geoms[hit_geom_index].materialid;
+            intersections[path_index].materialId = hit_material_id;
             intersections[path_index].surfaceNormal = normal;
         }
     }
@@ -373,34 +430,36 @@ __global__ void computeIntersections(
 /**
  * buildMaterialSortKeys is a helper kernel to build an array of integer keys for sorting path segments by material type.
  * The keys are constructed such that the higher 8 bits represent the material type bucket 
- * (emissive, specular, diffuse, miss, dead) and the lower 24 bits represent the original index of the path segment. 
- * This allows us to sort the path segments by material type while still being able to retrieve the original path segment index after sorting. 
+ * (emissive, specular, diffuse, miss, dead). For hit rays, the lower 24 bits store materialId to enable
+ * bucket + materialId secondary sorting. For miss/dead rays, the lower 24 bits store the path index so keys remain unique. 
  * This should be called after computing intersections and before shading to group path segments by material type for better memory coherence during shading
  */
 __global__ void buildMaterialSortKeys(const PathSegment* pathSegments, const ShadeableIntersection* intersections, 
-const Material* materials, int num_paths, int* materialSortKeys)
+const Material* materials, int materialCount, int num_paths, int* materialSortKeys)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= num_paths)
         return;
 
     const ShadeableIntersection isect = intersections[idx];
-    const int mid = isect.materialId;
-    const Material m = materials[mid];
     
     // Dead paths put in the end
     if(pathSegments[idx].remainingBounces <= 0)
     {
-        materialSortKeys[idx] = (BUCKET_DEAD << 24); // bucket | idx
+        materialSortKeys[idx] = (BUCKET_DEAD << 24) | (idx & 0x00FFFFFF);
         return;
     }
 
+    const int mid = isect.materialId;
+
     // Then the missed rays before dead ones
-    if(isect.t <= 0.0f || isect.materialId < 0)
+    if(isect.t <= 0.0f || mid < 0 || mid >= materialCount)
     {
-        materialSortKeys[idx] = (BUCKET_MISS << 24); // bucket | idx
+        materialSortKeys[idx] = (BUCKET_MISS << 24) | (idx & 0x00FFFFFF);
         return;
     }
+
+    const Material m = materials[mid];
 
     // rays hit are sorted by material types
 
@@ -414,7 +473,7 @@ const Material* materials, int num_paths, int* materialSortKeys)
         bucket = BUCKET_SPECULAR;
     }
 
-    materialSortKeys[idx] = (bucket << 24) | (mid & 0x00FFFFFF); // bucket | idx
+    materialSortKeys[idx] = (bucket << 24) | (mid & 0x00FFFFFF);
     
 }
 
@@ -577,6 +636,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_geoms,
             hst_scene->geoms.size(),
+            dev_triangles,
+            static_cast<int>(hst_scene->triangles.size()),
+            dev_meshRanges,
+            static_cast<int>(hst_scene->meshRanges.size()),
             dev_intersections
         );
         pathtraceCheckCUDA("trace one bounce", __LINE__);
@@ -590,6 +653,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
                 dev_paths,
                 dev_intersections,
                 dev_materials,
+                static_cast<int>(hst_scene->materials.size()),
                 num_paths,
                 dev_materialSortKeys
             );

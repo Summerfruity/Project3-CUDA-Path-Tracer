@@ -4,6 +4,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtx/intersect.hpp>
+#include <glm/gtx/norm.hpp>
 
 
 /**
@@ -71,3 +72,43 @@ __host__ __device__ float sphereIntersectionTest(
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
     bool& outside);
+
+
+/**
+ * Test intersection between a ray and an axis-aligned bounding box (AABB) 
+ * defined by its minimum and maximum corners.  
+ * Returns true if the ray intersects the AABB, false otherwise. 
+ * If there is an intersection, tEnter and tExit are set to the parametric distances along the ray 
+ * where it enters and exits the box, respectively. 
+ *
+ * @param bmin              Minimum corner of the AABB.
+ * @param bmax              Maximum corner of the AABB.
+ * @param r                 The ray to test for intersection.
+ * @param tEnter            Output parameter for the parametric distance along the ray where it enters the box.
+ * @param tExit             Output parameter for the parametric distance along the ray where it exits the box.
+ * @return                  True if the ray intersects the AABB, false otherwise
+ */
+__host__ __device__ bool aabbIntersectionTest(
+    const glm::vec3& bmin,
+    const glm::vec3& bmax,
+    const Ray& r,
+    float& tEnter,
+    float& tExit
+);
+
+
+
+/**
+ * Test intersection between a ray and a triangle defined by its three vertices and vertex normals.
+ * @param intersectionPoint  Output parameter for point of intersection.
+ * @param normal             Output parameter for surface normal (interpolated from vertex normals if available).
+ * @param outside            Output param for whether the ray came from outside (determined by the angle between the ray direction and the triangle normal).
+ * @return                   Ray parameter `t` value. -1 if no intersection.
+ */
+__host__ __device__ float triangleIntersectionTest(
+    const Triangle& triangle,
+    const Ray& r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside
+);

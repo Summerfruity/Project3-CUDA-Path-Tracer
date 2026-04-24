@@ -48,6 +48,28 @@ struct Geom
     glm::mat4 invTranspose;
 };
 
+struct Triangle
+{
+    glm::vec3 v1;
+    glm::vec3 v2;
+    glm::vec3 v3;
+    glm::vec3 n1;
+    glm::vec3 n2;
+    glm::vec3 n3;
+    int materialid;
+    int hasVertexNormals; // to avoid branching in the shader, we use an int instead of a bool
+};
+
+struct MeshRange
+{
+    int triStartIndex; // Starting index into the global triangle array (Triangle*).
+    int triCount;      // Number of triangles in this mesh.
+    glm::vec3 aabbMin;     // Minimum corner of the axis-aligned bounding box (AABB) for this mesh.
+    glm::vec3 aabbMax;     // Maximum corner of the AABB for this mesh.
+};
+
+
+
 struct Material
 {
     // Base color / albedo used for diffuse shading.
