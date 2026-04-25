@@ -12,19 +12,18 @@
 #include <glm/gtc/quaternion.hpp> // For handling rotations if needed
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp> // For glm::value_ptr
-#include "json.hpp"
 
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <unordered_map>
 #include <filesystem> // C++17 filesystem library for path manipulation
 #include <limits>
 #include <cstdint> // For fixed-width integer types like uint32_t
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 
 using namespace std;
-using json = nlohmann::json;
 
 namespace
 {
@@ -36,6 +35,189 @@ namespace
         int32_t type = 0; // GLTF type (e.g., VEC3, SCALAR)
         int32_t stride = 0; // Byte stride between elements (0 means tightly packed)
     };
+
+    [[noreturn]] void FailSceneLoad(const std::string& message)
+    {
+        throw std::runtime_error(message);
+    }
+
+    Material MakeFallbackMaterial()
+    {
+        Material fallback{};
+        fallback.color = glm::vec3(0.8f);
+        fallback.specular.exponent = 0.0f;
+        fallback.specular.color = glm::vec3(1.0f);
+        fallback.hasReflective = 0.0f;
+        fallback.hasRefractive = 0.0f;
+        fallback.indexOfRefraction = 1.0f;
+        fallback.emittance = 0.0f;
+        return fallback;
+    }
+
+    int EnsureFallbackMaterial(std::vector<Material>& materials)
+    {
+        materials.push_back(MakeFallbackMaterial());
+        return static_cast<int>(materials.size()) - 1;
+    }
+
+    Material ConvertGLTFMaterial(const tg3_material& gltfMaterial)
+    {
+        Material material = MakeFallbackMaterial();
+
+        const glm::vec3 baseColor(
+            static_cast<float>(gltfMaterial.pbr_metallic_roughness.base_color_factor[0]),
+            static_cast<float>(gltfMaterial.pbr_metallic_roughness.base_color_factor[1]),
+            static_cast<float>(gltfMaterial.pbr_metallic_roughness.base_color_factor[2]));
+        const glm::vec3 emissiveColor(
+            static_cast<float>(gltfMaterial.emissive_factor[0]),
+            static_cast<float>(gltfMaterial.emissive_factor[1]),
+            static_cast<float>(gltfMaterial.emissive_factor[2]));
+
+        const float emissiveStrength = std::max(emissiveColor.r, std::max(emissiveColor.g, emissiveColor.b));
+
+        material.color = baseColor;
+        material.specular.color = baseColor;
+        material.specular.exponent = static_cast<float>(gltfMaterial.pbr_metallic_roughness.roughness_factor);
+
+        if (emissiveStrength > 0.0f)
+        {
+            material.color = emissiveColor / emissiveStrength;
+            material.emittance = emissiveStrength;
+        }
+
+        return material;
+    }
+
+    struct SceneBounds
+    {
+        bool valid = false;
+        glm::vec3 min = glm::vec3(0.0f);
+        glm::vec3 max = glm::vec3(0.0f);
+
+        void expand(const glm::vec3& point)
+        {
+            if (!valid)
+            {
+                min = point;
+                max = point;
+                valid = true;
+                return;
+            }
+
+            min = glm::min(min, point);
+            max = glm::max(max, point);
+        }
+
+        void expand(const glm::vec3& boundsMin, const glm::vec3& boundsMax)
+        {
+            expand(boundsMin);
+            expand(boundsMax);
+        }
+
+        glm::vec3 center() const
+        {
+            return valid ? 0.5f * (min + max) : glm::vec3(0.0f);
+        }
+
+        glm::vec3 size() const
+        {
+            return valid ? (max - min) : glm::vec3(0.0f);
+        }
+
+        float radius() const
+        {
+            return valid ? std::max(glm::length(size()) * 0.5f, 0.5f) : 1.0f;
+        }
+    };
+
+    struct GLTFNodeTransform
+    {
+        int32_t nodeIndex = -1;
+        glm::mat4 world = glm::mat4(1.0f);
+    };
+
+    struct ImportedCameraSpec
+    {
+        bool valid = false;
+        glm::vec3 position = glm::vec3(0.0f);
+        glm::vec3 lookAt = glm::vec3(0.0f, 0.0f, -1.0f);
+        glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+        float fovyDegrees = 45.0f;
+        float aspectRatio = 1.0f;
+    };
+
+    std::string TG3ToStdString(const tg3_str& value)
+    {
+        if (!value.data || value.len == 0)
+        {
+            return std::string();
+        }
+        return std::string(value.data, value.len);
+    }
+
+    void DumpGLTFErrors(const tg3_error_stack& errors)
+    {
+        const uint32_t count = tg3_errors_count(&errors);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const tg3_error_entry* entry = tg3_errors_get(&errors, i);
+            if (!entry)
+            {
+                continue;
+            }
+
+            cerr << "GLTF error: "
+                 << (entry->message ? entry->message : "(no message)");
+            if (entry->json_path)
+            {
+                cerr << " at " << entry->json_path;
+            }
+            cerr << endl;
+        }
+    }
+
+    bool ParseGLTFFile(const std::string& gltfPath, tg3_model& model, tg3_error_stack& errors)
+    {
+        model = tg3_model{};
+        model.default_scene = -1;
+
+        errors = tg3_error_stack{};
+        tg3_error_stack_init(&errors);
+
+        tg3_parse_options options{};
+        tg3_parse_options_init(&options);
+
+        const tg3_error_code parseCode = tg3_parse_file(
+            &model,
+            &errors,
+            gltfPath.c_str(),
+            static_cast<uint32_t>(gltfPath.size()),
+            &options);
+
+        if (parseCode != TG3_OK || tg3_errors_has_error(&errors))
+        {
+            cerr << "Failed to parse GLTF file: " << gltfPath << " (code " << parseCode << ")" << endl;
+            DumpGLTFErrors(errors);
+            return false;
+        }
+
+        if (model.nodes_count == 0)
+        {
+            cerr << "GLTF has no nodes: " << gltfPath << endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    Material MakeEmissiveMaterial(const glm::vec3& color, float emittance)
+    {
+        Material material = MakeFallbackMaterial();
+        material.color = color;
+        material.specular.color = color;
+        material.emittance = emittance;
+        return material;
+    }
     
 }
 
@@ -205,280 +387,8 @@ static glm::mat4 NodeLocalMatrix(const tg3_node& node)
     return glm::translate(glm::mat4(1.0f), t) * glm::mat4_cast(q) * glm::scale(glm::mat4(1.0f), s);
 }
 
-
-
-
-Scene::Scene(string filename)
+static std::vector<int32_t> CollectGLTFRootNodes(const tg3_model& model)
 {
-    cout << "Reading scene from " << filename << " ..." << endl;
-    cout << " " << endl;
-    auto ext = filename.substr(filename.find_last_of('.'));
-    if (ext == ".json")
-    {
-        loadFromJSON(filename);
-        return;
-    }
-    else
-    {
-        cout << "Couldn't read from " << filename << endl;
-        exit(-1);
-    }
-}
-
-void Scene::loadFromJSON(const std::string& jsonName)
-{
-    std::ifstream f(jsonName);
-    json data = json::parse(f);
-    const auto& materialsData = data["Materials"];
-    std::unordered_map<std::string, uint32_t> MatNameToID;
-    for (const auto& item : materialsData.items())
-    {
-        const auto& name = item.key();
-        const auto& p = item.value();
-        Material newMaterial{};
-        // TODO: handle materials loading differently
-        if (p["TYPE"] == "Diffuse")
-        {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
-            newMaterial.hasReflective = 0.f;
-            newMaterial.hasRefractive = 0.f;
-            newMaterial.emittance = 0.f;
-
-        }
-        else if (p["TYPE"] == "Emitting")
-        {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
-            newMaterial.emittance = p["EMITTANCE"];
-            newMaterial.hasReflective = 0.f;
-            newMaterial.hasRefractive = 0.f;
-        }
-        else if (p["TYPE"] == "Specular")
-        {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
-            newMaterial.specular.color = newMaterial.color;
-            newMaterial.hasReflective = 1.0f;
-            newMaterial.hasRefractive = 0.f;
-            newMaterial.emittance = 0.f;
-            
-            if (p.contains("ROUGHNESS")) 
-            {
-                newMaterial.specular.exponent = p["ROUGHNESS"];
-            } 
-            else 
-            {
-                newMaterial.specular.exponent = 0.0f; 
-            }
-        }
-        MatNameToID[name] = materials.size();
-        materials.emplace_back(newMaterial);
-    }
-    const std::filesystem::path scenePath(jsonName);
-    const std::filesystem::path sceneDir = scenePath.has_parent_path()
-        ? scenePath.parent_path()
-        : std::filesystem::current_path();
-
-    const auto& objectsData = data["Objects"];
-    for (const auto& p : objectsData)
-    {
-        const std::string type = p.value("TYPE", "");
-
-        if (type == "gltf")
-        {
-            if (!p.contains("FILE"))
-            {
-                cerr << "GLTF object is missing FILE field." << endl;
-                continue;
-            }
-
-            const std::string gltfFile = p["FILE"].get<std::string>();
-            const auto& trans = p["TRANS"];
-            const auto& rotat = p["ROTAT"];
-            const auto& scale = p["SCALE"];
-
-            glm::vec3 translation(trans[0], trans[1], trans[2]);
-            glm::vec3 rotation(rotat[0], rotat[1], rotat[2]);
-            glm::vec3 scaling(scale[0], scale[1], scale[2]);
-            glm::mat4 objectTransform = utilityCore::buildTransformationMatrix(
-                translation, rotation, scaling);
-
-            int materialOverride = -1;
-            if (p.contains("MATERIAL"))
-            {
-                const std::string materialName = p["MATERIAL"].get<std::string>();
-                auto it = MatNameToID.find(materialName);
-                if (it != MatNameToID.end())
-                {
-                    materialOverride = static_cast<int>(it->second);
-                }
-                else
-                {
-                    cerr << "GLTF object references unknown material: " << materialName << endl;
-                }
-            }
-
-            std::filesystem::path resolvedPath = std::filesystem::path(gltfFile);
-            if (!resolvedPath.is_absolute())
-            {
-                resolvedPath = sceneDir / resolvedPath;
-            }
-            resolvedPath = resolvedPath.lexically_normal();
-
-            if (!loadGLTFObject(resolvedPath.string(), objectTransform, materialOverride))
-            {
-                cerr << "Failed to load GLTF object: " << resolvedPath.string() << endl;
-            }
-
-            continue;
-        }
-
-        Geom newGeom;
-        if (type == "cube")
-        {
-            newGeom.type = CUBE;
-        }
-        else
-        {
-            newGeom.type = SPHERE;
-        }
-        newGeom.materialid = MatNameToID[p["MATERIAL"]];
-        const auto& trans = p["TRANS"];
-        const auto& rotat = p["ROTAT"];
-        const auto& scale = p["SCALE"];
-        newGeom.translation = glm::vec3(trans[0], trans[1], trans[2]);
-        newGeom.rotation = glm::vec3(rotat[0], rotat[1], rotat[2]);
-        newGeom.scale = glm::vec3(scale[0], scale[1], scale[2]);
-        newGeom.transform = utilityCore::buildTransformationMatrix(
-            newGeom.translation, newGeom.rotation, newGeom.scale);
-        newGeom.inverseTransform = glm::inverse(newGeom.transform);
-        newGeom.invTranspose = glm::inverseTranspose(newGeom.transform);
-
-        geoms.push_back(newGeom);
-    }
-    const auto& cameraData = data["Camera"];
-    Camera& camera = state.camera;
-    RenderState& state = this->state;
-    camera.resolution.x = cameraData["RES"][0];
-    camera.resolution.y = cameraData["RES"][1];
-    float fovy = cameraData["FOVY"];
-    state.iterations = cameraData["ITERATIONS"];
-    state.traceDepth = cameraData["DEPTH"];
-    state.imageName = cameraData["FILE"];
-    const auto& pos = cameraData["EYE"];
-    const auto& lookat = cameraData["LOOKAT"];
-    const auto& up = cameraData["UP"];
-    camera.position = glm::vec3(pos[0], pos[1], pos[2]);
-    camera.lookAt = glm::vec3(lookat[0], lookat[1], lookat[2]);
-    camera.up = glm::vec3(up[0], up[1], up[2]);
-
-    //calculate fov based on resolution
-    float yscaled = tan(fovy * (PI / 180));
-    float xscaled = (yscaled * camera.resolution.x) / camera.resolution.y;
-    float fovx = (atan(xscaled) * 180) / PI;
-    camera.fov = glm::vec2(fovx, fovy);
-
-    camera.right = glm::normalize(glm::cross(camera.view, camera.up));
-    camera.pixelLength = glm::vec2(2 * xscaled / (float)camera.resolution.x,
-        2 * yscaled / (float)camera.resolution.y);
-
-    camera.view = glm::normalize(camera.lookAt - camera.position);
-
-    //set up render camera stuff
-    int arraylen = camera.resolution.x * camera.resolution.y;
-    state.image.resize(arraylen);
-    std::fill(state.image.begin(), state.image.end(), glm::vec3());
-}
-
-
-/**
- * Helper function to load a GLTF file and add its geometry to the scene. 
- * This function uses the tinygltf library to parse the GLTF file, extract mesh data, and convert it into the internal representation of triangles and materials used by the scene. 
- * It handles the transformation of vertices based on the provided object transform and applies a material override if specified.  
- * @param gltfPath The file path to the GLTF file to load.
- * @param objectTransform A glm::mat4 representing the transformation to apply to the geometry loaded from the GLTF file.
- * @param materialOverride An integer index into the scene's materials array to use for all geometry loaded from the GLTF file, or -1 to use the materials specified in the GLTF file. 
- * @return True if the GLTF file was successfully loaded and its geometry added to the scene, false if there was an error during loading or processing.
- */
-bool Scene::loadGLTFObject(const std::string& gltfPath, const glm::mat4& objectTransform, int materialOverride)
-{
-    tg3_model model{};
-    model.default_scene = -1;
-
-    tg3_error_stack errors{};
-    tg3_error_stack_init(&errors);
-
-    tg3_parse_options options{};
-    tg3_parse_options_init(&options);
-
-    const tg3_error_code parseCode = tg3_parse_file(
-        &model,
-        &errors,
-        gltfPath.c_str(),
-        static_cast<uint32_t>(gltfPath.size()),
-        &options);
-
-    auto dumpErrors = [&errors]() {
-        const uint32_t count = tg3_errors_count(&errors);
-        for (uint32_t i = 0; i < count; ++i)
-        {
-            const tg3_error_entry* entry = tg3_errors_get(&errors, i);
-            if (!entry)
-            {
-                continue;
-            }
-
-            cerr << "GLTF error: "
-                 << (entry->message ? entry->message : "(no message)");
-            if (entry->json_path)
-            {
-                cerr << " at " << entry->json_path;
-            }
-            cerr << endl;
-        }
-    };
-
-    if (parseCode != TG3_OK || tg3_errors_has_error(&errors))
-    {
-        cerr << "Failed to parse GLTF file: " << gltfPath << " (code " << parseCode << ")" << endl;
-        dumpErrors();
-        tg3_model_free(&model);
-        tg3_error_stack_free(&errors);
-        return false;
-    }
-
-    if (model.nodes_count == 0)
-    {
-        cerr << "GLTF has no nodes: " << gltfPath << endl;
-        tg3_model_free(&model);
-        tg3_error_stack_free(&errors);
-        return false;
-    }
-
-    if (materials.empty())
-    {
-        Material fallback{};
-        fallback.color = glm::vec3(0.8f);
-        fallback.specular.exponent = 0.0f;
-        fallback.specular.color = glm::vec3(1.0f);
-        fallback.hasReflective = 0.0f;
-        fallback.hasRefractive = 0.0f;
-        fallback.indexOfRefraction = 1.0f;
-        fallback.emittance = 0.0f;
-        materials.push_back(fallback);
-    }
-
-    int resolvedMaterialId = materialOverride;
-    if (resolvedMaterialId < 0 || resolvedMaterialId >= static_cast<int>(materials.size()))
-    {
-        if (resolvedMaterialId >= static_cast<int>(materials.size()))
-        {
-            cerr << "Material override out of range for GLTF object, falling back to material 0." << endl;
-        }
-        resolvedMaterialId = 0;
-    }
-
     std::vector<int32_t> rootNodes;
 
     if (model.scenes_count > 0)
@@ -495,56 +405,60 @@ bool Scene::loadGLTFObject(const std::string& gltfPath, const glm::mat4& objectT
         {
             rootNodes.push_back(scene.nodes[i]);
         }
+        return rootNodes;
     }
-    else
+
+    std::vector<uint8_t> isChild(model.nodes_count, 0);
+    for (uint32_t i = 0; i < model.nodes_count; ++i)
     {
-        std::vector<uint8_t> isChild(model.nodes_count, 0);
-        for (uint32_t i = 0; i < model.nodes_count; ++i)
+        const tg3_node& node = model.nodes[i];
+        for (uint32_t c = 0; c < node.children_count; ++c)
         {
-            const tg3_node& node = model.nodes[i];
-            for (uint32_t c = 0; c < node.children_count; ++c)
+            const int32_t child = node.children[c];
+            if (child >= 0 && child < static_cast<int32_t>(model.nodes_count))
             {
-                const int32_t child = node.children[c];
-                if (child >= 0 && child < static_cast<int32_t>(model.nodes_count))
-                {
-                    isChild[child] = 1;
-                }
+                isChild[child] = 1;
             }
-        }
-
-        for (uint32_t i = 0; i < model.nodes_count; ++i)
-        {
-            if (!isChild[i])
-            {
-                rootNodes.push_back(static_cast<int32_t>(i));
-            }
-        }
-
-        if (rootNodes.empty())
-        {
-            rootNodes.push_back(0);
         }
     }
 
+    for (uint32_t i = 0; i < model.nodes_count; ++i)
+    {
+        if (!isChild[i])
+        {
+            rootNodes.push_back(static_cast<int32_t>(i));
+        }
+    }
+
+    if (rootNodes.empty())
+    {
+        rootNodes.push_back(0);
+    }
+
+    return rootNodes;
+}
+
+static std::vector<GLTFNodeTransform> CollectGLTFNodeWorldTransforms(const tg3_model& model, const glm::mat4& objectTransform)
+{
     struct NodeWorkItem
     {
         int32_t nodeIndex;
         glm::mat4 parentWorld;
     };
 
+    std::vector<GLTFNodeTransform> nodeWorlds;
     std::vector<NodeWorkItem> workStack;
-    workStack.reserve(rootNodes.size() + 16);
+    const std::vector<int32_t> rootNodes = CollectGLTFRootNodes(model);
 
+    workStack.reserve(rootNodes.size() + 16);
     for (int i = static_cast<int>(rootNodes.size()) - 1; i >= 0; --i)
     {
         workStack.push_back(NodeWorkItem{ rootNodes[i], objectTransform });
     }
 
-    const size_t trianglesBefore = triangles.size();
-
     while (!workStack.empty())
     {
-        NodeWorkItem work = workStack.back();
+        const NodeWorkItem work = workStack.back();
         workStack.pop_back();
 
         if (work.nodeIndex < 0 || work.nodeIndex >= static_cast<int32_t>(model.nodes_count))
@@ -554,195 +468,7 @@ bool Scene::loadGLTFObject(const std::string& gltfPath, const glm::mat4& objectT
 
         const tg3_node& node = model.nodes[work.nodeIndex];
         const glm::mat4 nodeWorld = work.parentWorld * NodeLocalMatrix(node);
-
-        if (node.mesh >= 0 && node.mesh < static_cast<int32_t>(model.meshes_count))
-        {
-            const tg3_mesh& mesh = model.meshes[node.mesh];
-
-            const int triStartIndex = static_cast<int>(triangles.size());
-            glm::vec3 aabbMin(std::numeric_limits<float>::max());
-            glm::vec3 aabbMax(-std::numeric_limits<float>::max());
-            bool meshHasTriangle = false;
-
-            const float det = glm::determinant(glm::mat3(nodeWorld));
-            glm::mat3 normalMatrix(1.0f);
-            if (glm::abs(det) > 1e-12f)
-            {
-                normalMatrix = glm::transpose(glm::inverse(glm::mat3(nodeWorld)));
-            }
-
-            for (uint32_t p = 0; p < mesh.primitives_count; ++p)
-            {
-                const tg3_primitive& prim = mesh.primitives[p];
-                if (prim.mode != -1 && prim.mode != TG3_MODE_TRIANGLES)
-                {
-                    continue;
-                }
-
-                const int32_t posAccessorIndex = FindPrimitiveAttribute(prim, "POSITION");
-                if (posAccessorIndex < 0)
-                {
-                    continue;
-                }
-
-                AccessorView posView;
-                if (!BuildAccessorView(&model, posAccessorIndex, posView))
-                {
-                    continue;
-                }
-
-                if (posView.type != TG3_TYPE_VEC3 || posView.componentType != TG3_COMPONENT_TYPE_FLOAT)
-                {
-                    cerr << "Skipping primitive with unsupported POSITION format in " << gltfPath << endl;
-                    continue;
-                }
-
-                bool hasVertexNormals = false;
-                AccessorView nrmView;
-                const int32_t nrmAccessorIndex = FindPrimitiveAttribute(prim, "NORMAL");
-                if (nrmAccessorIndex >= 0)
-                {
-                    if (BuildAccessorView(&model, nrmAccessorIndex, nrmView) &&
-                        nrmView.type == TG3_TYPE_VEC3 &&
-                        nrmView.componentType == TG3_COMPONENT_TYPE_FLOAT &&
-                        nrmView.count == posView.count)
-                    {
-                        hasVertexNormals = true;
-                    }
-                }
-
-                bool hasIndices = false;
-                AccessorView idxView;
-                if (prim.indices >= 0)
-                {
-                    if (!BuildAccessorView(&model, prim.indices, idxView))
-                    {
-                        continue;
-                    }
-
-                    const bool indexTypeSupported =
-                        (idxView.componentType == TG3_COMPONENT_TYPE_UNSIGNED_BYTE) ||
-                        (idxView.componentType == TG3_COMPONENT_TYPE_UNSIGNED_SHORT) ||
-                        (idxView.componentType == TG3_COMPONENT_TYPE_UNSIGNED_INT);
-
-                    if (idxView.type != TG3_TYPE_SCALAR || !indexTypeSupported)
-                    {
-                        cerr << "Skipping primitive with unsupported index format in " << gltfPath << endl;
-                        continue;
-                    }
-
-                    hasIndices = true;
-                }
-
-                const uint64_t indexCount = hasIndices ? idxView.count : posView.count;
-                if (indexCount < 3)
-                {
-                    continue;
-                }
-
-                const uint64_t triangleCount = indexCount / 3;
-                if (triangleCount == 0)
-                {
-                    continue;
-                }
-
-                for (uint64_t tri = 0; tri < triangleCount; ++tri)
-                {
-                    uint32_t i0 = 0;
-                    uint32_t i1 = 0;
-                    uint32_t i2 = 0;
-
-                    if (hasIndices)
-                    {
-                        i0 = ReadIndex(idxView, tri * 3 + 0);
-                        i1 = ReadIndex(idxView, tri * 3 + 1);
-                        i2 = ReadIndex(idxView, tri * 3 + 2);
-                    }
-                    else
-                    {
-                        i0 = static_cast<uint32_t>(tri * 3 + 0);
-                        i1 = static_cast<uint32_t>(tri * 3 + 1);
-                        i2 = static_cast<uint32_t>(tri * 3 + 2);
-                    }
-
-                    if (i0 >= posView.count || i1 >= posView.count || i2 >= posView.count)
-                    {
-                        continue;
-                    }
-
-                    glm::vec3 p0 = ReadVec3F32(posView, i0);
-                    glm::vec3 p1 = ReadVec3F32(posView, i1);
-                    glm::vec3 p2 = ReadVec3F32(posView, i2);
-
-                    glm::vec3 w0 = glm::vec3(nodeWorld * glm::vec4(p0, 1.0f));
-                    glm::vec3 w1 = glm::vec3(nodeWorld * glm::vec4(p1, 1.0f));
-                    glm::vec3 w2 = glm::vec3(nodeWorld * glm::vec4(p2, 1.0f));
-
-                    glm::vec3 faceNormal = glm::cross(w1 - w0, w2 - w0);
-                    if (glm::length(faceNormal) <= 1e-12f)
-                    {
-                        continue;
-                    }
-                    faceNormal = glm::normalize(faceNormal);
-
-                    Triangle triOut{};
-                    triOut.v1 = w0;
-                    triOut.v2 = w1;
-                    triOut.v3 = w2;
-                    triOut.materialid = resolvedMaterialId;
-
-                    if (hasVertexNormals && i0 < nrmView.count && i1 < nrmView.count && i2 < nrmView.count)
-                    {
-                        glm::vec3 n0 = glm::normalize(normalMatrix * ReadVec3F32(nrmView, i0));
-                        glm::vec3 n1 = glm::normalize(normalMatrix * ReadVec3F32(nrmView, i1));
-                        glm::vec3 n2 = glm::normalize(normalMatrix * ReadVec3F32(nrmView, i2));
-
-                        if (glm::length(n0) <= 1e-12f || glm::length(n1) <= 1e-12f || glm::length(n2) <= 1e-12f)
-                        {
-                            triOut.n1 = faceNormal;
-                            triOut.n2 = faceNormal;
-                            triOut.n3 = faceNormal;
-                            triOut.hasVertexNormals = 0;
-                        }
-                        else
-                        {
-                            triOut.n1 = n0;
-                            triOut.n2 = n1;
-                            triOut.n3 = n2;
-                            triOut.hasVertexNormals = 1;
-                        }
-                    }
-                    else
-                    {
-                        triOut.n1 = faceNormal;
-                        triOut.n2 = faceNormal;
-                        triOut.n3 = faceNormal;
-                        triOut.hasVertexNormals = 0;
-                    }
-
-                    triangles.push_back(triOut);
-                    meshHasTriangle = true;
-
-                    aabbMin = glm::min(aabbMin, w0);
-                    aabbMin = glm::min(aabbMin, w1);
-                    aabbMin = glm::min(aabbMin, w2);
-
-                    aabbMax = glm::max(aabbMax, w0);
-                    aabbMax = glm::max(aabbMax, w1);
-                    aabbMax = glm::max(aabbMax, w2);
-                }
-            }
-
-            if (meshHasTriangle)
-            {
-                MeshRange range{};
-                range.triStartIndex = triStartIndex;
-                range.triCount = static_cast<int>(triangles.size()) - triStartIndex;
-                range.aabbMin = aabbMin;
-                range.aabbMax = aabbMax;
-                meshRanges.push_back(range);
-            }
-        }
+        nodeWorlds.push_back(GLTFNodeTransform{ work.nodeIndex, nodeWorld });
 
         for (int c = static_cast<int>(node.children_count) - 1; c >= 0; --c)
         {
@@ -755,11 +481,630 @@ bool Scene::loadGLTFObject(const std::string& gltfPath, const glm::mat4& objectT
         }
     }
 
-    const bool loadedAnyTriangle = triangles.size() > trianglesBefore;
+    return nodeWorlds;
+}
+
+static glm::ivec2 BuildResolutionFromAspect(float aspectRatio)
+{
+    const float clampedAspect = (aspectRatio > 1e-4f) ? aspectRatio : 1.0f;
+    const int height = 800;
+    const int width = std::max(1, static_cast<int>(std::round(height * clampedAspect)));
+    return glm::ivec2(width, height);
+}
+
+static void InitializeRenderState(RenderState& state,
+                                  const glm::ivec2& resolution,
+                                  float fovyDegrees,
+                                  unsigned int iterations,
+                                  int traceDepth,
+                                  const std::string& imageName,
+                                  const glm::vec3& position,
+                                  const glm::vec3& lookAt,
+                                  const glm::vec3& upHint)
+{
+    Camera& camera = state.camera;
+    camera.resolution = glm::max(resolution, glm::ivec2(1));
+    camera.position = position;
+    camera.lookAt = lookAt;
+
+    glm::vec3 view = lookAt - position;
+    if (glm::length(view) <= 1e-6f)
+    {
+        view = glm::vec3(0.0f, 0.0f, -1.0f);
+    }
+    camera.view = glm::normalize(view);
+
+    glm::vec3 up = upHint;
+    if (glm::length(up) <= 1e-6f)
+    {
+        up = glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+    up = glm::normalize(up);
+
+    glm::vec3 right = glm::cross(camera.view, up);
+    if (glm::length(right) <= 1e-6f)
+    {
+        const glm::vec3 fallbackAxis =
+            (glm::abs(camera.view.y) < 0.99f) ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        right = glm::cross(camera.view, fallbackAxis);
+    }
+    camera.right = glm::normalize(right);
+    camera.up = glm::normalize(glm::cross(camera.right, camera.view));
+
+    const float fovy = std::max(fovyDegrees, 1.0f);
+    const float yscaled = tan(fovy * (PI / 180.0f));
+    const float xscaled = (yscaled * camera.resolution.x) / static_cast<float>(camera.resolution.y);
+    const float fovx = (atan(xscaled) * 180.0f) / PI;
+    camera.fov = glm::vec2(fovx, fovy);
+    camera.pixelLength = glm::vec2(
+        2.0f * xscaled / static_cast<float>(camera.resolution.x),
+        2.0f * yscaled / static_cast<float>(camera.resolution.y));
+
+    state.iterations = iterations;
+    state.traceDepth = traceDepth;
+    state.imageName = imageName;
+    state.image.assign(camera.resolution.x * camera.resolution.y, glm::vec3(0.0f));
+}
+
+static ImportedCameraSpec ExtractGLTFCamera(const tg3_model& model,
+                                            const std::vector<GLTFNodeTransform>& nodeWorlds)
+{
+    ImportedCameraSpec spec{};
+
+    for (const GLTFNodeTransform& nodeTransform : nodeWorlds)
+    {
+        const tg3_node& node = model.nodes[nodeTransform.nodeIndex];
+        if (node.camera < 0 || node.camera >= static_cast<int32_t>(model.cameras_count))
+        {
+            continue;
+        }
+
+        const tg3_camera& camera = model.cameras[node.camera];
+        const glm::mat3 basis(nodeTransform.world);
+
+        spec.position = glm::vec3(nodeTransform.world * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        spec.lookAt = spec.position + glm::normalize(basis * glm::vec3(0.0f, 0.0f, -1.0f));
+        spec.up = glm::normalize(basis * glm::vec3(0.0f, 1.0f, 0.0f));
+        spec.fovyDegrees = 45.0f;
+        spec.aspectRatio = 1.0f;
+        spec.valid = true;
+
+        if (tg3_str_equals_cstr(camera.type, "perspective"))
+        {
+            spec.fovyDegrees = 0.5f * glm::degrees(static_cast<float>(camera.perspective.yfov));
+            if (camera.perspective.aspect_ratio > 1e-6)
+            {
+                spec.aspectRatio = static_cast<float>(camera.perspective.aspect_ratio);
+            }
+        }
+        else if (tg3_str_equals_cstr(camera.type, "orthographic"))
+        {
+            if (camera.orthographic.ymag > 1e-6)
+            {
+                spec.aspectRatio = static_cast<float>(camera.orthographic.xmag / camera.orthographic.ymag);
+            }
+            cerr << "Approximating orthographic glTF camera as a 45-degree perspective camera." << endl;
+        }
+
+        return spec;
+    }
+
+    return spec;
+}
+
+static std::string BuildImageBaseName(const std::string& sourcePath)
+{
+    const std::filesystem::path path(sourcePath);
+    const std::string stem = path.stem().string();
+    return stem.empty() ? "render" : stem;
+}
+
+static void FinalizeGeom(Geom& geom)
+{
+    geom.transform = utilityCore::buildTransformationMatrix(geom.translation, geom.rotation, geom.scale);
+    geom.inverseTransform = glm::inverse(geom.transform);
+    geom.invTranspose = glm::inverseTranspose(geom.transform);
+}
+
+static int AddMaterial(Scene& scene, const Material& material)
+{
+    scene.materials.push_back(material);
+    return static_cast<int>(scene.materials.size()) - 1;
+}
+
+static void AddLightSphere(Scene& scene,
+                           const glm::vec3& position,
+                           float radius,
+                           const glm::vec3& color,
+                           float emittance)
+{
+    Geom lightGeom{};
+    lightGeom.type = SPHERE;
+    lightGeom.materialid = AddMaterial(scene, MakeEmissiveMaterial(color, emittance));
+    lightGeom.translation = position;
+    lightGeom.rotation = glm::vec3(0.0f);
+    lightGeom.scale = glm::vec3(std::max(radius * 2.0f, 0.02f));
+    FinalizeGeom(lightGeom);
+    scene.geoms.push_back(lightGeom);
+}
+
+static void AddLightCube(Scene& scene,
+                         const glm::vec3& position,
+                         const glm::vec3& scale,
+                         const glm::vec3& color,
+                         float emittance)
+{
+    Geom lightGeom{};
+    lightGeom.type = CUBE;
+    lightGeom.materialid = AddMaterial(scene, MakeEmissiveMaterial(color, emittance));
+    lightGeom.translation = position;
+    lightGeom.rotation = glm::vec3(0.0f);
+    lightGeom.scale = glm::max(scale, glm::vec3(0.02f));
+    FinalizeGeom(lightGeom);
+    scene.geoms.push_back(lightGeom);
+}
+
+static int ImportGLTFLights(Scene& scene,
+                            const tg3_model& model,
+                            const std::vector<GLTFNodeTransform>& nodeWorlds,
+                            const SceneBounds& sceneBounds)
+{
+    const glm::vec3 boundsCenter = sceneBounds.center();
+    const float sceneRadius = sceneBounds.radius();
+    const float pointProxyRadius = std::max(sceneRadius * 0.05f, 0.05f);
+    int importedLightCount = 0;
+
+    for (const GLTFNodeTransform& nodeTransform : nodeWorlds)
+    {
+        const tg3_node& node = model.nodes[nodeTransform.nodeIndex];
+        if (node.light < 0)
+        {
+            continue;
+        }
+
+        if (node.light >= static_cast<int32_t>(model.lights_count))
+        {
+            cerr << "Skipping glTF light with out-of-range index " << node.light << endl;
+            continue;
+        }
+
+        const tg3_light& light = model.lights[node.light];
+        glm::vec3 color(
+            static_cast<float>(light.color[0]),
+            static_cast<float>(light.color[1]),
+            static_cast<float>(light.color[2]));
+        if (glm::length(color) <= 1e-6f)
+        {
+            color = glm::vec3(1.0f);
+        }
+
+        const float emittance = std::max(static_cast<float>(light.intensity), 1.0f);
+        const glm::vec3 position = glm::vec3(nodeTransform.world * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        glm::vec3 forward = glm::vec3(nodeTransform.world * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));
+        if (glm::length(forward) <= 1e-6f)
+        {
+            forward = glm::vec3(0.0f, 0.0f, -1.0f);
+        }
+        forward = glm::normalize(forward);
+
+        if (tg3_str_equals_cstr(light.type, "directional"))
+        {
+            const glm::vec3 proxyPosition = boundsCenter - forward * std::max(sceneRadius * 3.0f, 2.0f);
+            AddLightSphere(scene, proxyPosition, std::max(sceneRadius * 0.75f, 0.5f), color, emittance);
+        }
+        else
+        {
+            if (tg3_str_equals_cstr(light.type, "spot"))
+            {
+                cerr << "Approximating glTF spot light '" << TG3ToStdString(light.name)
+                     << "' as an omni-directional emissive sphere." << endl;
+            }
+            AddLightSphere(scene, position, pointProxyRadius, color, emittance);
+        }
+
+        ++importedLightCount;
+    }
+
+    return importedLightCount;
+}
+
+static bool SceneHasEmissiveMaterial(const Scene& scene)
+{
+    return std::any_of(
+        scene.materials.begin(),
+        scene.materials.end(),
+        [](const Material& material) { return material.emittance > 0.0f; });
+}
+
+static void AddDefaultSceneLight(Scene& scene, const SceneBounds& sceneBounds)
+{
+    const glm::vec3 center = sceneBounds.center();
+    const glm::vec3 size = glm::max(sceneBounds.size(), glm::vec3(1.0f));
+    const glm::vec3 scale(
+        std::max(size.x * 0.3f, 0.5f),
+        std::max(size.y * 0.02f, 0.05f),
+        std::max(size.z * 0.3f, 0.5f));
+    const glm::vec3 position(
+        center.x,
+        sceneBounds.valid ? (sceneBounds.max.y - std::max(scale.y, size.y * 0.05f)) : 2.0f,
+        center.z);
+
+    AddLightCube(scene, position, scale, glm::vec3(1.0f), 15.0f);
+}
+
+static ImportedCameraSpec BuildDefaultCameraSpec(const SceneBounds& sceneBounds)
+{
+    ImportedCameraSpec spec{};
+    const glm::vec3 center = sceneBounds.center();
+    const float radius = sceneBounds.radius();
+    const float fovyDegrees = 45.0f;
+    const float fovyRadians = glm::radians(fovyDegrees);
+    const float distance = radius / std::tan(fovyRadians * 0.5f) + radius * 0.5f;
+
+    spec.valid = true;
+    spec.position = center + glm::vec3(0.0f, radius * 0.35f, distance);
+    spec.lookAt = center;
+    spec.up = glm::vec3(0.0f, 1.0f, 0.0f);
+    spec.fovyDegrees = fovyDegrees;
+    spec.aspectRatio = 1.0f;
+    return spec;
+}
+
+
+
+
+Scene::Scene(string filename)
+{
+    cout << "Reading scene from " << filename << " ..." << endl;
+    cout << " " << endl;
+    const std::string ext = std::filesystem::path(filename).extension().string();
+    if (ext == ".gltf" || ext == ".glb")
+    {
+        loadFromGLTFScene(filename);
+        return;
+    }
+    else
+    {
+        cout << "Unsupported scene format '" << ext << "'. Please provide a .gltf or .glb file." << endl;
+        exit(-1);
+    }
+}
+
+static bool LoadGLTFModelGeometry(Scene& scene,
+                                  const tg3_model& model,
+                                  const std::string& gltfPath,
+                                  const std::vector<GLTFNodeTransform>& nodeWorlds,
+                                  int materialOverride,
+                                  SceneBounds* importedBounds)
+{
+    int fallbackMaterialId = -1;
+    auto getFallbackMaterialId = [&scene, &fallbackMaterialId]() -> int
+    {
+        if (fallbackMaterialId < 0)
+        {
+            fallbackMaterialId = EnsureFallbackMaterial(scene.materials);
+        }
+        return fallbackMaterialId;
+    };
+
+    int resolvedMaterialOverride = materialOverride;
+    if (resolvedMaterialOverride >= static_cast<int>(scene.materials.size()))
+    {
+        cerr << "Material override out of range for GLTF object, using fallback material." << endl;
+        resolvedMaterialOverride = getFallbackMaterialId();
+    }
+
+    std::vector<int> gltfMaterialToScene(model.materials_count, -1);
+    for (uint32_t materialIndex = 0; materialIndex < model.materials_count; ++materialIndex)
+    {
+        gltfMaterialToScene[materialIndex] = static_cast<int>(scene.materials.size());
+        scene.materials.push_back(ConvertGLTFMaterial(model.materials[materialIndex]));
+    }
+
+    const size_t trianglesBefore = scene.triangles.size();
+
+    for (const GLTFNodeTransform& nodeTransform : nodeWorlds)
+    {
+        const tg3_node& node = model.nodes[nodeTransform.nodeIndex];
+        const glm::mat4& nodeWorld = nodeTransform.world;
+
+        if (node.mesh < 0 || node.mesh >= static_cast<int32_t>(model.meshes_count))
+        {
+            continue;
+        }
+
+        const tg3_mesh& mesh = model.meshes[node.mesh];
+
+        const int triStartIndex = static_cast<int>(scene.triangles.size());
+        glm::vec3 aabbMin(std::numeric_limits<float>::max());
+        glm::vec3 aabbMax(-std::numeric_limits<float>::max());
+        bool meshHasTriangle = false;
+
+        const float det = glm::determinant(glm::mat3(nodeWorld));
+        glm::mat3 normalMatrix(1.0f);
+        if (glm::abs(det) > 1e-12f)
+        {
+            normalMatrix = glm::transpose(glm::inverse(glm::mat3(nodeWorld)));
+        }
+
+        for (uint32_t p = 0; p < mesh.primitives_count; ++p)
+        {
+            const tg3_primitive& prim = mesh.primitives[p];
+            if (prim.mode != -1 && prim.mode != TG3_MODE_TRIANGLES)
+            {
+                continue;
+            }
+
+            const int32_t posAccessorIndex = FindPrimitiveAttribute(prim, "POSITION");
+            if (posAccessorIndex < 0)
+            {
+                continue;
+            }
+
+            AccessorView posView;
+            if (!BuildAccessorView(&model, posAccessorIndex, posView))
+            {
+                continue;
+            }
+
+            if (posView.type != TG3_TYPE_VEC3 || posView.componentType != TG3_COMPONENT_TYPE_FLOAT)
+            {
+                cerr << "Skipping primitive with unsupported POSITION format in " << gltfPath << endl;
+                continue;
+            }
+
+            bool hasVertexNormals = false;
+            AccessorView nrmView;
+            const int32_t nrmAccessorIndex = FindPrimitiveAttribute(prim, "NORMAL");
+            if (nrmAccessorIndex >= 0)
+            {
+                if (BuildAccessorView(&model, nrmAccessorIndex, nrmView) &&
+                    nrmView.type == TG3_TYPE_VEC3 &&
+                    nrmView.componentType == TG3_COMPONENT_TYPE_FLOAT &&
+                    nrmView.count == posView.count)
+                {
+                    hasVertexNormals = true;
+                }
+            }
+
+            bool hasIndices = false;
+            AccessorView idxView;
+            if (prim.indices >= 0)
+            {
+                if (!BuildAccessorView(&model, prim.indices, idxView))
+                {
+                    continue;
+                }
+
+                const bool indexTypeSupported =
+                    (idxView.componentType == TG3_COMPONENT_TYPE_UNSIGNED_BYTE) ||
+                    (idxView.componentType == TG3_COMPONENT_TYPE_UNSIGNED_SHORT) ||
+                    (idxView.componentType == TG3_COMPONENT_TYPE_UNSIGNED_INT);
+
+                if (idxView.type != TG3_TYPE_SCALAR || !indexTypeSupported)
+                {
+                    cerr << "Skipping primitive with unsupported index format in " << gltfPath << endl;
+                    continue;
+                }
+
+                hasIndices = true;
+            }
+
+            const uint64_t indexCount = hasIndices ? idxView.count : posView.count;
+            if (indexCount < 3)
+            {
+                continue;
+            }
+
+            const uint64_t triangleCount = indexCount / 3;
+            if (triangleCount == 0)
+            {
+                continue;
+            }
+
+            for (uint64_t tri = 0; tri < triangleCount; ++tri)
+            {
+                uint32_t i0 = 0;
+                uint32_t i1 = 0;
+                uint32_t i2 = 0;
+
+                if (hasIndices)
+                {
+                    i0 = ReadIndex(idxView, tri * 3 + 0);
+                    i1 = ReadIndex(idxView, tri * 3 + 1);
+                    i2 = ReadIndex(idxView, tri * 3 + 2);
+                }
+                else
+                {
+                    i0 = static_cast<uint32_t>(tri * 3 + 0);
+                    i1 = static_cast<uint32_t>(tri * 3 + 1);
+                    i2 = static_cast<uint32_t>(tri * 3 + 2);
+                }
+
+                if (i0 >= posView.count || i1 >= posView.count || i2 >= posView.count)
+                {
+                    continue;
+                }
+
+                glm::vec3 p0 = ReadVec3F32(posView, i0);
+                glm::vec3 p1 = ReadVec3F32(posView, i1);
+                glm::vec3 p2 = ReadVec3F32(posView, i2);
+
+                glm::vec3 w0 = glm::vec3(nodeWorld * glm::vec4(p0, 1.0f));
+                glm::vec3 w1 = glm::vec3(nodeWorld * glm::vec4(p1, 1.0f));
+                glm::vec3 w2 = glm::vec3(nodeWorld * glm::vec4(p2, 1.0f));
+
+                glm::vec3 faceNormal = glm::cross(w1 - w0, w2 - w0);
+                if (glm::length(faceNormal) <= 1e-12f)
+                {
+                    continue;
+                }
+                faceNormal = glm::normalize(faceNormal);
+
+                Triangle triOut{};
+                triOut.v1 = w0;
+                triOut.v2 = w1;
+                triOut.v3 = w2;
+                if (resolvedMaterialOverride >= 0)
+                {
+                    triOut.materialid = resolvedMaterialOverride;
+                }
+                else if (prim.material >= 0 && prim.material < static_cast<int32_t>(gltfMaterialToScene.size()))
+                {
+                    triOut.materialid = gltfMaterialToScene[prim.material];
+                }
+                else
+                {
+                    if (prim.material >= static_cast<int32_t>(gltfMaterialToScene.size()))
+                    {
+                        cerr << "Primitive material index out of range in " << gltfPath
+                             << ", using fallback material." << endl;
+                    }
+                    triOut.materialid = getFallbackMaterialId();
+                }
+
+                if (hasVertexNormals && i0 < nrmView.count && i1 < nrmView.count && i2 < nrmView.count)
+                {
+                    glm::vec3 n0 = glm::normalize(normalMatrix * ReadVec3F32(nrmView, i0));
+                    glm::vec3 n1 = glm::normalize(normalMatrix * ReadVec3F32(nrmView, i1));
+                    glm::vec3 n2 = glm::normalize(normalMatrix * ReadVec3F32(nrmView, i2));
+
+                    if (glm::length(n0) <= 1e-12f || glm::length(n1) <= 1e-12f || glm::length(n2) <= 1e-12f)
+                    {
+                        triOut.n1 = faceNormal;
+                        triOut.n2 = faceNormal;
+                        triOut.n3 = faceNormal;
+                        triOut.hasVertexNormals = 0;
+                    }
+                    else
+                    {
+                        triOut.n1 = n0;
+                        triOut.n2 = n1;
+                        triOut.n3 = n2;
+                        triOut.hasVertexNormals = 1;
+                    }
+                }
+                else
+                {
+                    triOut.n1 = faceNormal;
+                    triOut.n2 = faceNormal;
+                    triOut.n3 = faceNormal;
+                    triOut.hasVertexNormals = 0;
+                }
+
+                scene.triangles.push_back(triOut);
+                meshHasTriangle = true;
+
+                aabbMin = glm::min(aabbMin, w0);
+                aabbMin = glm::min(aabbMin, w1);
+                aabbMin = glm::min(aabbMin, w2);
+
+                aabbMax = glm::max(aabbMax, w0);
+                aabbMax = glm::max(aabbMax, w1);
+                aabbMax = glm::max(aabbMax, w2);
+            }
+        }
+
+        if (meshHasTriangle)
+        {
+            MeshRange range{};
+            range.triStartIndex = triStartIndex;
+            range.triCount = static_cast<int>(scene.triangles.size()) - triStartIndex;
+            range.aabbMin = aabbMin;
+            range.aabbMax = aabbMax;
+            scene.meshRanges.push_back(range);
+
+            if (importedBounds)
+            {
+                importedBounds->expand(aabbMin, aabbMax);
+            }
+        }
+    }
+
+    const bool loadedAnyTriangle = scene.triangles.size() > trianglesBefore;
     if (!loadedAnyTriangle)
     {
         cerr << "No valid triangles were loaded from GLTF: " << gltfPath << endl;
     }
+
+    return loadedAnyTriangle;
+}
+
+void Scene::loadFromGLTFScene(const std::string& gltfPath)
+{
+    tg3_model model{};
+    tg3_error_stack errors{};
+
+    if (!ParseGLTFFile(gltfPath, model, errors))
+    {
+        tg3_model_free(&model);
+        tg3_error_stack_free(&errors);
+        FailSceneLoad("Failed to load GLTF scene '" + gltfPath + "'.");
+    }
+
+    const std::vector<GLTFNodeTransform> nodeWorlds = CollectGLTFNodeWorldTransforms(model, glm::mat4(1.0f));
+    SceneBounds importedBounds;
+
+    if (!LoadGLTFModelGeometry(*this, model, gltfPath, nodeWorlds, -1, &importedBounds))
+    {
+        tg3_model_free(&model);
+        tg3_error_stack_free(&errors);
+        FailSceneLoad("No renderable geometry found in GLTF scene '" + gltfPath + "'.");
+    }
+
+    ImportedCameraSpec cameraSpec = ExtractGLTFCamera(model, nodeWorlds);
+    if (!cameraSpec.valid)
+    {
+        cameraSpec = BuildDefaultCameraSpec(importedBounds);
+    }
+
+    const int importedLightCount = ImportGLTFLights(*this, model, nodeWorlds, importedBounds);
+    if (importedLightCount == 0 && !SceneHasEmissiveMaterial(*this))
+    {
+        AddDefaultSceneLight(*this, importedBounds);
+    }
+
+    InitializeRenderState(
+        state,
+        BuildResolutionFromAspect(cameraSpec.aspectRatio),
+        cameraSpec.fovyDegrees,
+        5000,
+        8,
+        BuildImageBaseName(gltfPath),
+        cameraSpec.position,
+        cameraSpec.lookAt,
+        cameraSpec.up);
+
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+}
+
+
+/**
+ * Helper function to load a GLTF file and add its geometry to the scene. 
+ * This function uses the tinygltf library to parse the GLTF file, extract mesh data, and convert it into the internal representation of triangles and materials used by the scene. 
+ * It handles the transformation of vertices based on the provided object transform and applies a material override if specified.  
+ * @param gltfPath The file path to the GLTF file to load.
+ * @param objectTransform A glm::mat4 representing the transformation to apply to the geometry loaded from the GLTF file.
+ * @param materialOverride An integer index into the scene's materials array to use for all geometry loaded from the GLTF file, or -1 to use the materials specified in the GLTF file. 
+ * @return True if the GLTF file was successfully loaded and its geometry added to the scene, false if there was an error during loading or processing.
+ */
+bool Scene::loadGLTFObject(const std::string& gltfPath, const glm::mat4& objectTransform, int materialOverride)
+{
+    tg3_model model{};
+    tg3_error_stack errors{};
+
+    if (!ParseGLTFFile(gltfPath, model, errors))
+    {
+        tg3_model_free(&model);
+        tg3_error_stack_free(&errors);
+        return false;
+    }
+
+    const std::vector<GLTFNodeTransform> nodeWorlds =
+        CollectGLTFNodeWorldTransforms(model, objectTransform);
+    const bool loadedAnyTriangle =
+        LoadGLTFModelGeometry(*this, model, gltfPath, nodeWorlds, materialOverride, nullptr);
 
     tg3_model_free(&model);
     tg3_error_stack_free(&errors);

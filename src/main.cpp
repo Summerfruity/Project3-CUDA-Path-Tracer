@@ -21,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -64,6 +65,47 @@ void runCuda();
 void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods);
 void mousePositionCallback(GLFWwindow* window, double xpos, double ypos);
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+
+static bool tryParsePositiveInt(const char* text, int& value)
+{
+    if (!text || *text == '\0')
+    {
+        return false;
+    }
+
+    char* end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    if (!end || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max())
+    {
+        return false;
+    }
+
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+static void printUsage(const char* executable)
+{
+    printf("Usage: %s SCENEFILE.gltf|SCENEFILE.glb [--res WIDTH HEIGHT]\n", executable);
+}
+
+static void applyResolutionOverride(RenderState& state, int overrideWidth, int overrideHeight)
+{
+    Camera& cam = state.camera;
+    cam.resolution = glm::ivec2(overrideWidth, overrideHeight);
+
+    const float fovy = std::max(cam.fov.y, 1.0f);
+    const float yscaled = tan(fovy * (PI / 180.0f));
+    const float xscaled = (yscaled * cam.resolution.x) / static_cast<float>(cam.resolution.y);
+    const float fovx = (atan(xscaled) * 180.0f) / PI;
+
+    cam.fov.x = fovx;
+    cam.pixelLength = glm::vec2(
+        2.0f * xscaled / static_cast<float>(cam.resolution.x),
+        2.0f * yscaled / static_cast<float>(cam.resolution.y));
+
+    state.image.assign(cam.resolution.x * cam.resolution.y, glm::vec3(0.0f));
+}
 
 std::string currentTimeString()
 {
@@ -360,11 +402,35 @@ int main(int argc, char** argv)
 
     if (argc < 2)
     {
-        printf("Usage: %s SCENEFILE.json\n", argv[0]);
+        printUsage(argv[0]);
         return 1;
     }
 
     const char* sceneFile = argv[1];
+    int overrideWidth = 0;
+    int overrideHeight = 0;
+
+    for (int argIndex = 2; argIndex < argc; ++argIndex)
+    {
+        const std::string arg = argv[argIndex];
+        if (arg == "--res")
+        {
+            if (argIndex + 2 >= argc ||
+                !tryParsePositiveInt(argv[argIndex + 1], overrideWidth) ||
+                !tryParsePositiveInt(argv[argIndex + 2], overrideHeight))
+            {
+                fprintf(stderr, "Invalid resolution override. Expected --res WIDTH HEIGHT.\n");
+                printUsage(argv[0]);
+                return 1;
+            }
+            argIndex += 2;
+            continue;
+        }
+
+        fprintf(stderr, "Unknown argument: %s\n", argv[argIndex]);
+        printUsage(argv[0]);
+        return 1;
+    }
 
     // Load scene file
     scene = new Scene(sceneFile);
@@ -375,6 +441,10 @@ int main(int argc, char** argv)
     // Set up camera stuff from loaded path tracer settings
     iteration = 0;
     renderState = &scene->state;
+    if (overrideWidth > 0 && overrideHeight > 0)
+    {
+        applyResolutionOverride(*renderState, overrideWidth, overrideHeight);
+    }
     Camera& cam = renderState->camera;
     width = cam.resolution.x;
     height = cam.resolution.y;

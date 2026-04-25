@@ -6,7 +6,7 @@
 class Scene
 {
 private:
-    void loadFromJSON(const std::string& jsonName);
+    void loadFromGLTFScene(const std::string& gltfPath);
 
     // Loads a GLTF file and adds its geometry to the scene. Returns true on success, false on failure.
     bool loadGLTFObject(const std::string& gltfPath, const glm::mat4& objectTransform, int materialOverride);

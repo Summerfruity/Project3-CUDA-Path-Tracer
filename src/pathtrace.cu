@@ -105,6 +105,7 @@ static int* dev_activeFlags = NULL;
 static int* dev_scanIndices = NULL;
 static int* dev_newNumPaths = NULL;
 static int* dev_materialSortKeys = NULL;
+static int* dev_terminatedCount = NULL;
 
 enum MaterialTypeBucket
 {
@@ -160,6 +161,8 @@ void pathtraceInit(Scene* scene)
 
     cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
 
+    cudaMalloc(&dev_terminatedCount, sizeof(int));
+
     StreamCompaction::Efficient::initScanDeviceBuffer(pixelcount);
 
     pathtraceCheckCUDA("pathtraceInit", __LINE__);
@@ -178,6 +181,7 @@ void pathtraceFree()
     cudaFree(dev_scanIndices);
     cudaFree(dev_newNumPaths);
     cudaFree(dev_materialSortKeys);
+    cudaFree(dev_terminatedCount);
     cudaFree(dev_triangles);
     cudaFree(dev_meshRanges);
     StreamCompaction::Efficient::freeScanDeviceBuffer();
@@ -243,7 +247,7 @@ __global__ void scatterActivePaths(int num_paths, PathSegment* pathSegments, int
  * to the final image and reset their color to black. 
  * This should be called before stream compaction to ensure that we don't lose the contributions of terminated paths.
  */
-__global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegment* Paths)
+__global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegment* Paths, int* terminatedCount)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if(index < nPaths)
@@ -252,6 +256,7 @@ __global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegmen
         {
             image[Paths[index].pixelIndex] += Paths[index].color;
             Paths[index].color = glm::vec3(0.0f, 0.0f, 0.0f); // reset color after gathering to image
+            atomicAdd(terminatedCount, 1);
         }
 
     }
@@ -698,21 +703,20 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_materials
         );
 
-        // gather terminated paths to add their contribution to the image and reset their color to black before compaction
-        gatherTerminatedToImage<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_image, dev_paths);
+        cudaMemset(dev_terminatedCount, 0, sizeof(int));
+
+        // Gather terminated paths before optional compaction. We also count how
+        // many paths died this bounce so adaptive compaction can decide cheaply
+        // whether running scan/scatter is worth it.
+        gatherTerminatedToImage<<<numblocksPathSegmentTracing, blockSize1d>>>(
+            num_paths, dev_image, dev_paths, dev_terminatedCount);
         pathtraceCheckCUDA("shade one bounce", __LINE__);
 
         if (ENABLE_STREAM_COMPACTION)
         {
-            mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
-            pathtraceCheckCUDA("map active paths", __LINE__);
-
-            StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
-
-            computeActivePathCount<<<1, 1>>>(num_paths, dev_scanIndices, dev_activeFlags, dev_newNumPaths);
-
-            int newNumPaths = 0;
-            cudaMemcpy(&newNumPaths, dev_newNumPaths, sizeof(int), cudaMemcpyDeviceToHost);
+            int terminatedCount = 0;
+            cudaMemcpy(&terminatedCount, dev_terminatedCount, sizeof(int), cudaMemcpyDeviceToHost);
+            const int newNumPaths = num_paths - terminatedCount;
 
             if (newNumPaths == 0)
             {
@@ -729,6 +733,11 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
                 if (shouldCompact)
                 {
+                    mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
+                    pathtraceCheckCUDA("map active paths", __LINE__);
+
+                    StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
+
                     // scatter active paths to compact the path segments array based on the scan indices computed from the active flags
                     scatterActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags, dev_scanIndices, dev_paths_compact);
                     pathtraceCheckCUDA("scatter active paths", __LINE__);
