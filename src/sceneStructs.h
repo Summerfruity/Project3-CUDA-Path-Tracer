@@ -99,6 +99,15 @@ struct Camera
 
     // Size of a pixel on the image plane in world/viewport units.
     glm::vec2 pixelLength;
+
+    /**
+     * apertureRadius = 0: pinhole camera (no depth of field)
+     * apertureRadius > 0: depth of field
+     */
+    float apertureRadius; 
+
+    // distance from the camera position to the focal plane
+    float focalDistance;
 };
 
 struct RenderState

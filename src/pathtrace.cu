@@ -269,10 +269,34 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         }
 
 
-        segment.ray.direction = glm::normalize(cam.view
+        glm::vec3 pinholeDir = glm::normalize(cam.view
             - cam.right * cam.pixelLength.x * ((float)x + jitterX - (float)cam.resolution.x * 0.5f)
             - cam.up * cam.pixelLength.y * ((float)y + jitterY - (float)cam.resolution.y * 0.5f)
         );
+        segment.ray.direction = pinholeDir;
+
+        // depth of field
+        if(cam.apertureRadius > 0.0f) {
+            float u1 = u01(rng);
+            float u2 = u01(rng);
+
+            // turn to polar coordinate system
+            float r = cam.apertureRadius * sqrtf(u1);
+            float theta = TWO_PI * u2;
+
+            // get the disk sample in camera space
+            glm::vec2 disk = glm::vec2(r * cosf(theta), r * sinf(theta));
+
+            glm::vec3 lensOffset = disk.x * cam.right + disk.y * cam.up;
+            glm::vec3 lensOrigin = cam.position + lensOffset;
+
+            float focalT = cam.focalDistance / glm::dot(pinholeDir, cam.view);
+            glm::vec3 hitFocalPoint = cam.position + pinholeDir * focalT;
+
+            segment.ray.origin = lensOrigin;
+            segment.ray.direction = glm::normalize(hitFocalPoint - lensOrigin);
+        }
+
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
