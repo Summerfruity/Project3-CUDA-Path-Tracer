@@ -101,7 +101,7 @@ static ShadeableIntersection* dev_intersections = NULL;
 static PathSegment* dev_paths_compact = NULL; 
 static int* dev_activeFlags = NULL;
 static int* dev_scanIndices = NULL;
-static int* dev_newNumPaths = NULL;
+static int* dev_terminatedCount = NULL;
 static int* dev_materialSortKeys = NULL;
 
 enum MaterialTypeBucket
@@ -148,7 +148,7 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_scanIndices, pixelcount * sizeof(int));
     cudaMemset(dev_scanIndices, 0, pixelcount * sizeof(int));
 
-    cudaMalloc(&dev_newNumPaths, sizeof(int));
+    cudaMalloc(&dev_terminatedCount, sizeof(int));
 
     cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
 
@@ -164,36 +164,15 @@ void pathtraceFree()
     cudaFree(dev_geoms);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
-    // TODO: clean up any extra device memory you created
+    // clean up extra device memory
     cudaFree(dev_paths_compact);
     cudaFree(dev_activeFlags);
     cudaFree(dev_scanIndices);
-    cudaFree(dev_newNumPaths);
+    cudaFree(dev_terminatedCount);
     cudaFree(dev_materialSortKeys);
     StreamCompaction::Efficient::freeScanDeviceBuffer();
     pathtraceCheckCUDA("pathtraceFree", __LINE__);
 }
-
-/**
- * computeActivePathCount is a helper kernel to compute the number of active paths (remainingBounces > 0)
- */
-__global__ void computeActivePathCount(int n, const int* scanIndices, const int* activeFlags, int* outCount)
-{
-    // compute the number of active paths by looking at the last element of scanIndices and activeFlags
-
-    if(threadIdx.x == 0 && blockIdx.x == 0) // only need one thread to do this
-    {
-        if(n <= 0) // no paths, so count is 0 
-        {
-            outCount[0] = 0;
-            return;
-        }
-        int lastScan = scanIndices[n - 1];
-        int lastFlag = activeFlags[n - 1];
-        outCount[0] = lastScan + lastFlag; // number of active paths is the last scan index + the last flag (if the last path is active)
-    }
-}
-
 
 /**
  * mapActivePaths is a helper kernel to identify which paths are still active (remainingBounces > 0) 
@@ -233,7 +212,7 @@ __global__ void scatterActivePaths(int num_paths, PathSegment* pathSegments, int
  * to the final image and reset their color to black. 
  * This should be called before stream compaction to ensure that we don't lose the contributions of terminated paths.
  */
-__global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegment* Paths)
+__global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegment* Paths, int* terminatedCount)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if(index < nPaths)
@@ -242,6 +221,7 @@ __global__ void gatherTerminatedToImage(int nPaths, glm::vec3* image, PathSegmen
         {
             image[Paths[index].pixelIndex] += Paths[index].color;
             Paths[index].color = glm::vec3(0.0f, 0.0f, 0.0f); // reset color after gathering to image
+            atomicAdd(terminatedCount, 1);
         }
 
     }
@@ -272,7 +252,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.color = glm::vec3(0.0f, 0.0f, 0.0f); // initial color is black, no contribution to the final image until we start shading
         segment.throughput = glm::vec3(1.0f, 1.0f, 1.0f); // initial throughput is white, full contribution to the final image until we start shading and updating it based on the materials we interact with
 
-        // TODO: implement antialiasing by jittering the ray
+        // Jitter within the pixel footprint for stochastic antialiasing.
         thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, 0);
         thrust::uniform_real_distribution<float> u01(0, 1);
 
@@ -280,8 +260,12 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         float jitterY = 0.0f;
 
         if (enableAA) {
-            jitterX = u01(rng) - 0.5f;
-            jitterY = u01(rng) - 0.5f;
+            jitterX = u01(rng);
+            jitterY = u01(rng);
+        }
+        else {
+            jitterX = 0.5f;
+            jitterY = 0.5f;
         }
 
 
@@ -373,8 +357,7 @@ __global__ void computeIntersections(
 /**
  * buildMaterialSortKeys is a helper kernel to build an array of integer keys for sorting path segments by material type.
  * The keys are constructed such that the higher 8 bits represent the material type bucket 
- * (emissive, specular, diffuse, miss, dead) and the lower 24 bits represent the original index of the path segment. 
- * This allows us to sort the path segments by material type while still being able to retrieve the original path segment index after sorting. 
+ * (emissive, specular, diffuse, miss, dead) and the lower 24 bits group paths by material id within each bucket.
  * This should be called after computing intersections and before shading to group path segments by material type for better memory coherence during shading
  */
 __global__ void buildMaterialSortKeys(const PathSegment* pathSegments, const ShadeableIntersection* intersections, 
@@ -386,7 +369,6 @@ const Material* materials, int num_paths, int* materialSortKeys)
 
     const ShadeableIntersection isect = intersections[idx];
     const int mid = isect.materialId;
-    const Material m = materials[mid];
     
     // Dead paths put in the end
     if(pathSegments[idx].remainingBounces <= 0)
@@ -403,6 +385,7 @@ const Material* materials, int num_paths, int* materialSortKeys)
     }
 
     // rays hit are sorted by material types
+    const Material m = materials[mid];
 
     int bucket = BUCKET_DIFFUSE;
     if(m.emittance > 0.0f)
@@ -553,7 +536,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     // TODO: perform one iteration of path tracing
 
-    generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, guiData->enableAntialiasing);
+    const bool ENABLE_ANTIALIASING = (guiData != NULL) ? guiData->enableAntialiasing : true;
+
+    generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, ENABLE_ANTIALIASING);
     pathtraceCheckCUDA("generate camera ray", __LINE__);
 
     int depth = 0; // depth is how many times the ray has bounced, not to be confused with iter, which is how many paths have been traced
@@ -628,20 +613,19 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         );
 
         // gather terminated paths to add their contribution to the image and reset their color to black before compaction
-        gatherTerminatedToImage<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_image, dev_paths);
+        cudaMemset(dev_terminatedCount, 0, sizeof(int));
+        gatherTerminatedToImage<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_image, dev_paths, dev_terminatedCount);
         pathtraceCheckCUDA("shade one bounce", __LINE__);
 
         if (ENABLE_STREAM_COMPACTION)
         {
-            mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
-            pathtraceCheckCUDA("map active paths", __LINE__);
-
-            StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
-
-            computeActivePathCount<<<1, 1>>>(num_paths, dev_scanIndices, dev_activeFlags, dev_newNumPaths);
-
-            int newNumPaths = 0;
-            cudaMemcpy(&newNumPaths, dev_newNumPaths, sizeof(int), cudaMemcpyDeviceToHost);
+            int terminatedCount = 0;
+            cudaMemcpy(&terminatedCount, dev_terminatedCount, sizeof(int), cudaMemcpyDeviceToHost);
+            int newNumPaths = num_paths - terminatedCount;
+            if (newNumPaths < 0)
+            {
+                newNumPaths = 0;
+            }
 
             if (newNumPaths == 0)
             {
@@ -658,6 +642,11 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
                 if (shouldCompact)
                 {
+                    mapActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags);
+                    pathtraceCheckCUDA("map active paths", __LINE__);
+
+                    StreamCompaction::Efficient::scanDevice(num_paths, dev_scanIndices, dev_activeFlags);
+
                     // scatter active paths to compact the path segments array based on the scan indices computed from the active flags
                     scatterActivePaths<<<numblocksPathSegmentTracing, blockSize1d>>>(num_paths, dev_paths, dev_activeFlags, dev_scanIndices, dev_paths_compact);
                     pathtraceCheckCUDA("scatter active paths", __LINE__);
