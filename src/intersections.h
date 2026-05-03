@@ -44,7 +44,8 @@ __host__ __device__ inline glm::vec3 multiplyMV(glm::mat4 m, glm::vec4 v)
  * the cube ranges from -0.5 to 0.5 in each axis and is centered at the origin.
  *
  * @param intersectionPoint  Output parameter for point of intersection.
- * @param normal             Output parameter for surface normal.
+ * @param surfaceNormal      Output parameter for face-forward shading normal.
+ * @param geometricNormal    Output parameter for outward geometric normal.
  * @param outside            Output param for whether the ray came from outside.
  * @return                   Ray parameter `t` value. -1 if no intersection.
  */
@@ -52,7 +53,8 @@ __host__ __device__ float boxIntersectionTest(
     Geom box,
     Ray r,
     glm::vec3& intersectionPoint,
-    glm::vec3& normal,
+    glm::vec3& surfaceNormal,
+    glm::vec3& geometricNormal,
     bool& outside);
 
 // CHECKITOUT
@@ -61,7 +63,8 @@ __host__ __device__ float boxIntersectionTest(
  * the sphere always has radius 0.5 and is centered at the origin.
  *
  * @param intersectionPoint  Output parameter for point of intersection.
- * @param normal             Output parameter for surface normal.
+ * @param surfaceNormal      Output parameter for face-forward shading normal.
+ * @param geometricNormal    Output parameter for outward geometric normal.
  * @param outside            Output param for whether the ray came from outside.
  * @return                   Ray parameter `t` value. -1 if no intersection.
  */
@@ -69,5 +72,6 @@ __host__ __device__ float sphereIntersectionTest(
     Geom sphere,
     Ray r,
     glm::vec3& intersectionPoint,
-    glm::vec3& normal,
+    glm::vec3& surfaceNormal,
+    glm::vec3& geometricNormal,
     bool& outside);

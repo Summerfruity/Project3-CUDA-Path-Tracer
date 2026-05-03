@@ -43,6 +43,8 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
 __host__ __device__ void scatterRay(
     PathSegment& pathSegment,
     glm::vec3 intersect,
-    glm::vec3 normal,
+    glm::vec3 surfaceNormal,
+    glm::vec3 geometricNormal,
+    bool outside,
     const Material& m,
     thrust::default_random_engine& rng);

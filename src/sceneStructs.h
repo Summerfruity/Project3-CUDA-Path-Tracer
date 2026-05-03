@@ -152,11 +152,17 @@ struct PathSegment
 struct ShadeableIntersection
 {
     // Parametric distance along the ray. Convention: t < 0 means "no hit".
-  float t;
+    float t;
 
-    // World-space surface normal at the intersection.
-  glm::vec3 surfaceNormal;
+    // World-space shading normal at the intersection, oriented against the incoming ray.
+    glm::vec3 surfaceNormal;
+
+    // World-space geometric normal at the intersection, oriented outward from the primitive.
+    glm::vec3 geometricNormal;
 
     // Index into the global materials array (Material*).
-  int materialId;
+    int materialId;
+
+    // True when the ray hit the outside face; false when it exited from inside.
+    bool outside;
 };

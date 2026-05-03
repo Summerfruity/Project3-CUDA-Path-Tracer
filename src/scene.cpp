@@ -78,6 +78,15 @@ void Scene::loadFromJSON(const std::string& jsonName)
                 newMaterial.specular.exponent = 0.0f; 
             }
         }
+        else if (p["TYPE"] == "Refractive")
+        {
+            const auto& col = p["RGB"];
+            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+            newMaterial.hasReflective = 0.0f;
+            newMaterial.hasRefractive = 1.0f;
+            newMaterial.emittance = 0.0f;
+            newMaterial.indexOfRefraction = p.contains("IOR") ? (float)p["IOR"] : 1.5f;
+        }
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
     }

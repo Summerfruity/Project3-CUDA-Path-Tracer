@@ -108,9 +108,10 @@ enum MaterialTypeBucket
 {
     BUCKET_EMISSIVE = 0,
     BUCKET_SPECULAR = 1,
-    BUCKET_DIFFUSE  = 2,
-    BUCKET_MISS     = 3,
-    BUCKET_DEAD     = 4
+    BUCKET_REFRACTIVE = 2,
+    BUCKET_DIFFUSE = 3,
+    BUCKET_MISS = 4,
+    BUCKET_DEAD = 5
 };
 
 void InitDataContainer(GuiDataContainer* imGuiData)
@@ -328,13 +329,16 @@ __global__ void computeIntersections(
 
         float t; // distance along ray to intersection
         glm::vec3 intersect_point; // point of intersection
-        glm::vec3 normal;
+        glm::vec3 surfaceNormal;
+        glm::vec3 geometricNormal;
         float t_min = FLT_MAX;
         int hit_geom_index = -1;
         bool outside = true; // used to determine whether the intersection was from outside the surface or inside the surface, should be passed to the shader to determine how to shade the intersection
+        bool closest_outside = true;
 
         glm::vec3 tmp_intersect; // used if the ray intersects with the current geometry
-        glm::vec3 tmp_normal; 
+        glm::vec3 tmp_surfaceNormal;
+        glm::vec3 tmp_geometricNormal;
 
         // naive parse through global geoms
 
@@ -344,11 +348,11 @@ __global__ void computeIntersections(
 
             if (geom.type == CUBE)
             {
-                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_surfaceNormal, tmp_geometricNormal, outside);
             }
             else if (geom.type == SPHERE)
             {
-                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_surfaceNormal, tmp_geometricNormal, outside);
             }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 
@@ -359,20 +363,28 @@ __global__ void computeIntersections(
                 t_min = t;
                 hit_geom_index = i;
                 intersect_point = tmp_intersect;
-                normal = tmp_normal;
+                surfaceNormal = tmp_surfaceNormal;
+                geometricNormal = tmp_geometricNormal;
+                closest_outside = outside;
             }
         }
 
         if (hit_geom_index == -1)
         {
             intersections[path_index].t = -1.0f;
+            intersections[path_index].materialId = -1;
+            intersections[path_index].outside = true;
+            intersections[path_index].surfaceNormal = glm::vec3(0.0f);
+            intersections[path_index].geometricNormal = glm::vec3(0.0f);
         }
         else
         {
             // The ray hits something
             intersections[path_index].t = t_min;
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
-            intersections[path_index].surfaceNormal = normal;
+            intersections[path_index].surfaceNormal = surfaceNormal;
+            intersections[path_index].geometricNormal = geometricNormal;
+            intersections[path_index].outside = closest_outside;
         }
     }
 }
@@ -415,6 +427,10 @@ const Material* materials, int num_paths, int* materialSortKeys)
     if(m.emittance > 0.0f)
     {
         bucket = BUCKET_EMISSIVE;
+    }
+    else if (m.hasRefractive > 0.0f)
+    {
+        bucket = BUCKET_REFRACTIVE;
     }
     else if(m.hasReflective > 0.0f)
     {
@@ -474,8 +490,10 @@ __global__ void shadeFakeMaterial(
             else {
                 scatterRay(
                     pathSegments[idx], // pass by ref, modify it in place
-                    getPointOnRay(pathSegments[idx].ray, intersection.t), // intersect point
+                    pathSegments[idx].ray.origin + glm::normalize(pathSegments[idx].ray.direction) * intersection.t,
                     intersection.surfaceNormal,
+                    intersection.geometricNormal,
+                    intersection.outside,
                     material,
                     rng);
             }
