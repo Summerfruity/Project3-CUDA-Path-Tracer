@@ -16,6 +16,24 @@ enum GeomType
     CUBE
 };
 
+struct Triangle
+{
+    glm::vec3 v0, v1, v2;
+    glm::vec3 n0, n1, n2;
+    int materialId;
+};
+
+struct MeshRange
+{
+    int triStartIndex;
+    int triCount;
+    glm::vec3 aabbMin;
+    glm::vec3 aabbMax;
+};
+
+
+
+
 struct Ray
 {
     // World-space ray origin.

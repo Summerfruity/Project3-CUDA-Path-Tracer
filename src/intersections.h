@@ -75,3 +75,36 @@ __host__ __device__ float sphereIntersectionTest(
     glm::vec3& surfaceNormal,
     glm::vec3& geometricNormal,
     bool& outside);
+
+
+
+/**
+ * Test intersection between a ray and a triangle.
+ * @param tri                The triangle to test against.
+ * @param r                  The ray to test.
+ * @param intersectionPoint  Output parameter for point of intersection.
+ * @param surfaceNormal      Output parameter for face-forward shading normal.
+ * @param geometricNormal    Output parameter for outward geometric normal.
+ * @param outside            Output param for whether the ray came from outside.
+ * @return                   Ray parameter `t` value. -1 if no intersection.
+ */
+__host__ __device__ float triangleIntersectionTest(
+    const Triangle& tri,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& surfaceNormal,
+    glm::vec3& geometricNormal,
+    bool& outside);
+
+
+/**
+ * Test intersection between a ray and an axis-aligned bounding box.
+ * @param range              The AABB to test against.
+ * @param r                  The ray to test.
+ * @param maxT               The maximum `t` value to consider for intersections (e.g. the ray may have already hit something closer).
+ * @return                   Ray parameter `t` value. -1 if no intersection or if the intersection is farther than maxT.
+ */
+__host__ __device__ float aabbIntersectionTest(
+    const MeshRange& range,
+    Ray r,
+    float maxT);

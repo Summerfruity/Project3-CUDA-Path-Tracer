@@ -26,6 +26,8 @@
 #define ERRORCHECK 1
 #endif
 
+#define ENABLE_MESH_AABB_CULLING true
+
 void pathtraceCheckCUDAErrorFn(const char* msg, const char* file, int line)
 {
 #if ERRORCHECK
@@ -103,6 +105,8 @@ static int* dev_activeFlags = NULL;
 static int* dev_scanIndices = NULL;
 static int* dev_terminatedCount = NULL;
 static int* dev_materialSortKeys = NULL;
+static Triangle* dev_triangles = NULL;
+static MeshRange* dev_meshRanges = NULL; // the range of triangles and AABB of each mash/primitive
 
 enum MaterialTypeBucket
 {
@@ -134,13 +138,18 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
     cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
 
+    cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+    cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&dev_meshRanges, scene->meshRanges.size() * sizeof(MeshRange));
+    cudaMemcpy(dev_meshRanges, scene->meshRanges.data(), scene->meshRanges.size() * sizeof(MeshRange), cudaMemcpyHostToDevice);
+
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
-    // initialize any extra device memeory you need
     cudaMalloc(&dev_paths_compact, pixelcount * sizeof(PathSegment));
 
     cudaMalloc(&dev_activeFlags, pixelcount * sizeof(int));
@@ -163,9 +172,10 @@ void pathtraceFree()
     cudaFree(dev_image);  // no-op if dev_image is null
     cudaFree(dev_paths);
     cudaFree(dev_geoms);
+    cudaFree(dev_triangles);
+    cudaFree(dev_meshRanges);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
-    // clean up extra device memory
     cudaFree(dev_paths_compact);
     cudaFree(dev_activeFlags);
     cudaFree(dev_scanIndices);
@@ -314,6 +324,10 @@ __global__ void computeIntersections(
     PathSegment* pathSegments,
     Geom* geoms,
     int geoms_size,
+    Triangle* triangles,
+    MeshRange* meshRanges,
+    int meshRanges_size,
+    bool enableMeshAabbCulling,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -331,8 +345,10 @@ __global__ void computeIntersections(
         glm::vec3 intersect_point; // point of intersection
         glm::vec3 surfaceNormal;
         glm::vec3 geometricNormal;
-        float t_min = FLT_MAX;
+        float t_min = FLT_MAX; // the minimum t for the intersections, used to determine which geometry is intersected first, should be initialized to a very large value at the beginning of each iteration
         int hit_geom_index = -1;
+        int hit_triangle_material_id = -1;
+        bool hit_from_triangle = false;
         bool outside = true; // used to determine whether the intersection was from outside the surface or inside the surface, should be passed to the shader to determine how to shade the intersection
         bool closest_outside = true;
 
@@ -369,7 +385,43 @@ __global__ void computeIntersections(
             }
         }
 
-        if (hit_geom_index == -1)
+        // naive parse through meshs
+        for(int i = 0; i < meshRanges_size; i++)
+        {
+            const MeshRange range = meshRanges[i];
+            int triCount = range.triCount;
+
+            // AABB culling
+            if(enableMeshAabbCulling)
+            {
+                float aabbT = aabbIntersectionTest(range, pathSegment.ray, t_min);
+                if(aabbT < 0)
+                    continue;
+            }
+
+            for(int j = 0; j < triCount; j++)
+            {
+                const Triangle& tri = triangles[range.triStartIndex + j];
+                bool tmp_outside;
+                t = triangleIntersectionTest(tri, pathSegment.ray, tmp_intersect, 
+                                             tmp_surfaceNormal, tmp_geometricNormal, 
+                                             tmp_outside);
+
+                // update if hit closer                             
+                if (t > 0 && t < t_min)
+                {
+                    t_min = t;
+                    surfaceNormal = tmp_surfaceNormal;
+                    geometricNormal = tmp_geometricNormal;
+                    closest_outside = tmp_outside;
+                    hit_triangle_material_id = tri.materialId;
+                    hit_from_triangle = true;
+
+                }
+            }
+        }
+
+        if (hit_geom_index == -1 && !hit_from_triangle)
         {
             intersections[path_index].t = -1.0f;
             intersections[path_index].materialId = -1;
@@ -381,11 +433,13 @@ __global__ void computeIntersections(
         {
             // The ray hits something
             intersections[path_index].t = t_min;
-            intersections[path_index].materialId = geoms[hit_geom_index].materialid;
+            intersections[path_index].materialId = hit_from_triangle ? hit_triangle_material_id : geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = surfaceNormal;
             intersections[path_index].geometricNormal = geometricNormal;
             intersections[path_index].outside = closest_outside;
         }
+
+        
     }
 }
 
@@ -604,6 +658,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_geoms,
             hst_scene->geoms.size(),
+            dev_triangles,
+            dev_meshRanges,
+            hst_scene->meshRanges.size(),
+            ENABLE_MESH_AABB_CULLING,
             dev_intersections
         );
         pathtraceCheckCUDA("trace one bounce", __LINE__);

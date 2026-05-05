@@ -561,3 +561,4 @@ imgui.ini
 *.png
 .vscode
 INSTRUCTION_CHINESE.md
+scenes/Cube

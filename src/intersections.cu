@@ -123,3 +123,131 @@ __host__ __device__ float sphereIntersectionTest(
 
     return glm::length(r.origin - intersectionPoint);
 }
+
+
+__host__ __device__ float triangleIntersectionTest(
+    const Triangle& tri,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& surfaceNormal,
+    glm::vec3& geometricNormal,
+    bool& outside)
+{
+    const float TRIANGLE_EPSILON = 1e-6f;
+    glm::vec3 dir = glm::normalize(r.direction);
+    glm::vec3 edge1 = tri.v1 - tri.v0;
+    glm::vec3 edge2 = tri.v2 - tri.v0;
+    glm::vec3 pvec = glm::cross(dir, edge2);
+    float det = glm::dot(edge1, pvec);
+
+    if (glm::abs(det) < TRIANGLE_EPSILON)
+    {
+        return -1.0f;
+    }
+
+    float invDet = 1.0f / det;
+    glm::vec3 tvec = r.origin - tri.v0;
+    float u = glm::dot(tvec, pvec) * invDet;
+    if (u < 0.0f || u > 1.0f)
+    {
+        return -1.0f;
+    }
+
+    glm::vec3 qvec = glm::cross(tvec, edge1);
+    float v = glm::dot(dir, qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f)
+    {
+        return -1.0f;
+    }
+
+    float t = glm::dot(edge2, qvec) * invDet;
+    if (t <= TRIANGLE_EPSILON)
+    {
+        return -1.0f;
+    }
+
+    intersectionPoint = r.origin + t * dir;
+
+    glm::vec3 faceNormal = glm::cross(edge1, edge2);
+    float normalLengthSquared = glm::dot(faceNormal, faceNormal);
+    if (normalLengthSquared < TRIANGLE_EPSILON * TRIANGLE_EPSILON)
+    {
+        return -1.0f;
+    }
+
+    geometricNormal = glm::normalize(faceNormal);
+    outside = glm::dot(dir, geometricNormal) < 0.0f;
+    surfaceNormal = outside ? geometricNormal : -geometricNormal;
+
+    return t;
+}
+
+
+__host__ __device__ float aabbIntersectionTest(
+    const MeshRange& range,
+    Ray r,
+    float maxT)
+{
+
+    const float PARALLEL_EPSILON = 1e-6f;
+
+    glm::vec3 dir = glm::normalize(r.direction);
+
+    float tEnter = -FLT_MAX;
+    float tExit = FLT_MAX;
+
+    for(int axis = 0; axis < 3; axis++)
+    {
+        float origin = r.origin[axis];
+        float direction = dir[axis];
+        float minBox = range.aabbMin[axis];
+        float maxBox = range.aabbMax[axis];
+
+        if(glm::abs(direction) < PARALLEL_EPSILON)
+        {
+            // need to make sure the origin is outside the range
+            if(origin < minBox || origin > maxBox)
+            {
+                return -1.0f;
+            }
+            continue;
+        }
+
+        float t0 = (minBox - origin) / direction;
+        float t1 = (maxBox - origin) / direction;
+
+        if(t0 > t1)
+        {
+            float temp = t0;
+            t0 = t1;
+            t1 = temp;
+        }
+
+        tEnter = glm::max(t0, tEnter);
+        tExit = glm::min(tExit, t1);
+
+        if(tEnter > tExit)
+        {
+            return -1.0f;
+        }
+
+    }
+    
+    if(tExit <= 0.0f)
+    {
+        return -1.0f;
+    }
+
+    float hitT = tEnter > 0.0f ? tEnter : tExit;
+
+
+    // if hitT is greater than maxT, then we consider it a miss 
+    // because the ray would have already hit something else before reaching the box
+    if(hitT > maxT)
+    {
+        return -1.0f;
+    }
+
+    return hitT;
+
+}
