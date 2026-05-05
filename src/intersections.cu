@@ -131,8 +131,10 @@ __host__ __device__ float triangleIntersectionTest(
     glm::vec3& intersectionPoint,
     glm::vec3& surfaceNormal,
     glm::vec3& geometricNormal,
-    bool& outside)
+    bool& outside,
+    glm::vec2& uv)
 {
+    // Moller-Trumbore ray/triangle intersection in triangle space.
     const float TRIANGLE_EPSILON = 1e-6f;
     glm::vec3 dir = glm::normalize(r.direction);
     glm::vec3 edge1 = tri.v1 - tri.v0;
@@ -146,6 +148,7 @@ __host__ __device__ float triangleIntersectionTest(
     }
 
     float invDet = 1.0f / det;
+    // Compute barycentric u and test bounds.
     glm::vec3 tvec = r.origin - tri.v0;
     float u = glm::dot(tvec, pvec) * invDet;
     if (u < 0.0f || u > 1.0f)
@@ -153,6 +156,7 @@ __host__ __device__ float triangleIntersectionTest(
         return -1.0f;
     }
 
+    // Compute barycentric v and test bounds.
     glm::vec3 qvec = glm::cross(tvec, edge1);
     float v = glm::dot(dir, qvec) * invDet;
     if (v < 0.0f || u + v > 1.0f)
@@ -160,6 +164,7 @@ __host__ __device__ float triangleIntersectionTest(
         return -1.0f;
     }
 
+    // Ray parameter along direction.
     float t = glm::dot(edge2, qvec) * invDet;
     if (t <= TRIANGLE_EPSILON)
     {
@@ -177,7 +182,14 @@ __host__ __device__ float triangleIntersectionTest(
 
     geometricNormal = glm::normalize(faceNormal);
     outside = glm::dot(dir, geometricNormal) < 0.0f;
-    surfaceNormal = outside ? geometricNormal : -geometricNormal;
+
+    float w = 1.0f - u - v; // barycentric coordinate
+    glm::vec3 smoothN = glm::normalize(w * tri.n0 + u * tri.n1 + v * tri.n2);
+    surfaceNormal = outside ? smoothN : -smoothN;
+
+    // uv interpolation
+    uv = w * tri.uv0 + u * tri.uv1 + v * tri.uv2;
+
 
     return t;
 }
@@ -238,16 +250,16 @@ __host__ __device__ float aabbIntersectionTest(
         return -1.0f;
     }
 
-    float hitT = tEnter > 0.0f ? tEnter : tExit;
 
-
-    // if hitT is greater than maxT, then we consider it a miss 
-    // because the ray would have already hit something else before reaching the box
-    if(hitT > maxT)
+    
+    float tNear = glm::max(tEnter, 0.0f);
+    // if tNear is greater than maxT, it means the intersection is farther than the closest intersection we have found so far, so we should ignore this intersection
+    if (tNear > maxT) 
     {
         return -1.0f;
     }
 
-    return hitT;
+    // if tEnter is negative, it means the ray starts inside the box, so we should return tExit
+    return (tEnter > 0.0f) ? tEnter : tExit;
 
 }

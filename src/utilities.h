@@ -27,6 +27,7 @@ public:
     float compactionActiveRatioThreshold = 0.70f;
     int compactionMinPaths = 4096;
     bool enableAntialiasing = true;
+    bool enableMeshAabbCulling = true;
 };
 
 namespace utilityCore

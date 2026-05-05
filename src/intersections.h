@@ -94,7 +94,8 @@ __host__ __device__ float triangleIntersectionTest(
     glm::vec3& intersectionPoint,
     glm::vec3& surfaceNormal,
     glm::vec3& geometricNormal,
-    bool& outside);
+    bool& outside,
+    glm::vec2& uv);
 
 
 /**

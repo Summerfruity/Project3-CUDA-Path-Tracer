@@ -26,7 +26,6 @@
 #define ERRORCHECK 1
 #endif
 
-#define ENABLE_MESH_AABB_CULLING true
 
 void pathtraceCheckCUDAErrorFn(const char* msg, const char* file, int line)
 {
@@ -138,11 +137,27 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
     cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
 
-    cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
-    cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+    if (!scene->triangles.empty()) 
+    {
+        cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+        cudaMemcpy(dev_triangles, scene->triangles.data(),
+                    scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+    } 
+    else 
+    {
+        dev_triangles = nullptr;
+    }
 
-    cudaMalloc(&dev_meshRanges, scene->meshRanges.size() * sizeof(MeshRange));
-    cudaMemcpy(dev_meshRanges, scene->meshRanges.data(), scene->meshRanges.size() * sizeof(MeshRange), cudaMemcpyHostToDevice);
+    if (!scene->meshRanges.empty()) 
+    {
+        cudaMalloc(&dev_meshRanges, scene->meshRanges.size() * sizeof(MeshRange));
+        cudaMemcpy(dev_meshRanges, scene->meshRanges.data(),
+                    scene->meshRanges.size() * sizeof(MeshRange), cudaMemcpyHostToDevice);
+    } 
+    else 
+    {
+        dev_meshRanges = nullptr;
+    }
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
@@ -345,6 +360,7 @@ __global__ void computeIntersections(
         glm::vec3 intersect_point; // point of intersection
         glm::vec3 surfaceNormal;
         glm::vec3 geometricNormal;
+        glm::vec2 uv(0.0f); // the best uv found so far
         float t_min = FLT_MAX; // the minimum t for the intersections, used to determine which geometry is intersected first, should be initialized to a very large value at the beginning of each iteration
         int hit_geom_index = -1;
         int hit_triangle_material_id = -1;
@@ -355,6 +371,7 @@ __global__ void computeIntersections(
         glm::vec3 tmp_intersect; // used if the ray intersects with the current geometry
         glm::vec3 tmp_surfaceNormal;
         glm::vec3 tmp_geometricNormal;
+        glm::vec2 tmp_uv;
 
         // naive parse through global geoms
 
@@ -382,6 +399,7 @@ __global__ void computeIntersections(
                 surfaceNormal = tmp_surfaceNormal;
                 geometricNormal = tmp_geometricNormal;
                 closest_outside = outside;
+                uv = glm::vec2(0.0f);
             }
         }
 
@@ -405,18 +423,19 @@ __global__ void computeIntersections(
                 bool tmp_outside;
                 t = triangleIntersectionTest(tri, pathSegment.ray, tmp_intersect, 
                                              tmp_surfaceNormal, tmp_geometricNormal, 
-                                             tmp_outside);
+                                             tmp_outside, tmp_uv);
 
                 // update if hit closer                             
                 if (t > 0 && t < t_min)
                 {
                     t_min = t;
+                    intersect_point = tmp_intersect;
                     surfaceNormal = tmp_surfaceNormal;
                     geometricNormal = tmp_geometricNormal;
                     closest_outside = tmp_outside;
                     hit_triangle_material_id = tri.materialId;
                     hit_from_triangle = true;
-
+                    uv = tmp_uv;
                 }
             }
         }
@@ -428,6 +447,8 @@ __global__ void computeIntersections(
             intersections[path_index].outside = true;
             intersections[path_index].surfaceNormal = glm::vec3(0.0f);
             intersections[path_index].geometricNormal = glm::vec3(0.0f);
+            intersections[path_index].uv = glm::vec2(0.0f);
+
         }
         else
         {
@@ -437,6 +458,7 @@ __global__ void computeIntersections(
             intersections[path_index].surfaceNormal = surfaceNormal;
             intersections[path_index].geometricNormal = geometricNormal;
             intersections[path_index].outside = closest_outside;
+            intersections[path_index].uv = uv; 
         }
 
         
@@ -651,6 +673,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         cudaMemset(dev_intersections, 0, num_paths * sizeof(ShadeableIntersection));
 
         // tracing
+        const bool ENABLE_MESH_AABB_CULLING = (guiData != NULL) ? guiData->enableMeshAabbCulling : true;
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d; // number of blocks for tracing path segments, depends on the number of active paths
         computeIntersections<<<numblocksPathSegmentTracing, blockSize1d>>> (
             depth,

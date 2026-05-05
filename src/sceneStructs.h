@@ -20,6 +20,7 @@ struct Triangle
 {
     glm::vec3 v0, v1, v2;
     glm::vec3 n0, n1, n2;
+    glm::vec2 uv0, uv1, uv2;
     int materialId;
 };
 
@@ -177,6 +178,9 @@ struct ShadeableIntersection
 
     // World-space geometric normal at the intersection, oriented outward from the primitive.
     glm::vec3 geometricNormal;
+
+    // interpolated UV coordinates at the intersection, used for texture mapping.
+    glm::vec2 uv;
 
     // Index into the global materials array (Material*).
     int materialId;

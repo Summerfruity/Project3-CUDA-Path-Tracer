@@ -68,6 +68,24 @@ namespace
         }
     }
 
+
+    /**
+     * A helper function to read a vec2 value from a glTF accessor.
+     */
+    glm::vec2 readVec2Accessor(const tg3_model& model, int accessorIndex, uint32_t elementIndex)
+    {
+        const tg3_accessor& acc = model.accessors[accessorIndex];
+        const tg3_buffer_view& view = model.buffer_views[acc.buffer_view];
+        const tg3_buffer& buffer = model.buffers[view.buffer];
+
+        int stride = tg3_accessor_byte_stride(&acc, &view);
+        const uint8_t* base = buffer.data.data + view.byte_offset + acc.byte_offset;
+        const uint8_t* ptr = base + elementIndex * stride;
+
+        const float* f = reinterpret_cast<const float*>(ptr);
+        return glm::vec2(f[0], f[1]);
+    }
+
     /**
      * A helper function to read a vec3 value from a glTF accessor.
      * @param model: a reference to the tg3_model struct representing the loaded glTF model.
@@ -127,6 +145,48 @@ namespace
              * glm::mat4_cast(r)
              * glm::scale(glm::mat4(1.0f), s);
     }
+
+    /**
+     * A helper function to convert a tg3_material from the glTF model into our internal Material struct. 
+     * This function reads the base color, specular parameters, 
+     * and other relevant properties from the tg3_material 
+     * and populates a Material struct that can be used in our path tracer.
+     */
+    static Material convertGltfMaterial(const tg3_material& gm)
+    {
+        Material m{};
+
+        glm::vec3 baseColor((float)gm.pbr_metallic_roughness.base_color_factor[0],
+                            (float)gm.pbr_metallic_roughness.base_color_factor[1],
+                            (float)gm.pbr_metallic_roughness.base_color_factor[2]);
+
+        float metallic = (float)gm.pbr_metallic_roughness.metallic_factor;
+        float roughness = (float)gm.pbr_metallic_roughness.roughness_factor;
+
+        glm::vec3 emissive((float)gm.emissive_factor[0],
+                           (float)gm.emissive_factor[1],
+                           (float)gm.emissive_factor[2]);
+
+        metallic = glm::clamp(metallic, 0.0f, 1.0f);
+        roughness = glm::clamp(roughness, 0.0f, 1.0f);
+
+        m.color = baseColor;
+        m.specular.color = glm::mix(glm::vec3(0.04f), baseColor, metallic);
+        m.specular.exponent = roughness;
+        m.hasReflective = metallic;
+        m.hasRefractive = 0.0f;
+
+        float emMax = glm::max(emissive.x, glm::max(emissive.y, emissive.z));
+        if (emMax > 0.0f) {
+            m.color = emissive / emMax;
+            m.emittance = emMax;
+            m.hasReflective = 0.0f;
+        } else {
+            m.emittance = 0.0f;
+        }
+        return m;
+        
+    }
 }
 
 Scene::Scene(string filename)
@@ -184,7 +244,29 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
         return;
     }
 
+    // map from glTF material index to our internal material index. Initialized to -1 (invalid) for all materials.
+    std::vector<int> gltfMatToMaterial(model.materials_count, -1);
+
+    // traverse model.materials
+    const int materialBase = (int)materials.size();
+    materials.reserve(materials.size() + model.materials_count);
+
+    for(int i = 0; i < model.materials_count; ++i)
+    {
+        materials.push_back(convertGltfMaterial(model.materials[i]));
+        gltfMatToMaterial[i] = materialBase + i;
+    }
     
+
+    
+    /**
+     * A lambda function to process a single primitive from the glTF model. 
+     * This function reads the vertex data from the primitive's accessors, 
+     * applies the object transform, computes triangle normals, 
+     * and pushes Triangle objects into the triangles vector. 
+     * It also updates the axis-aligned bounding box (AABB) for the mesh range corresponding 
+     * to this primitive.        
+     */
     auto processPrimitive = [&](const tg3_primitive& prim, const glm::mat4& transform)
     {
         // Only process triangles for now
@@ -209,10 +291,51 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
             return;
         }
 
+        // find the accessor index for the NORMAL attribute
+        int normAccessorIndex = findAttributeAccessor(prim, "NORMAL"); 
+        bool hasNormals = false;
+        if(normAccessorIndex >= 0)
+        {
+            const tg3_accessor& normAcc = model.accessors[normAccessorIndex];
+            if (normAcc.type == TG3_TYPE_VEC3 && normAcc.component_type == TG3_COMPONENT_TYPE_FLOAT)
+            {
+                hasNormals = true;
+            }
+        }
+
+
+        // find the accessor index for the TEXCOORD_0 attribute
+        int uvAccessorIndex = findAttributeAccessor(prim, "TEXCOORD_0");
+        bool hasTexcoords = false;
+        if (uvAccessorIndex >= 0)
+        {
+            const tg3_accessor& uvAcc = model.accessors[uvAccessorIndex];
+            if (uvAcc.type == TG3_TYPE_VEC2 &&
+                uvAcc.component_type == TG3_COMPONENT_TYPE_FLOAT)
+            {
+                hasTexcoords = true;
+            }
+        }
+        
+        // normal can't be transformed with the regular model matrix if there are non-uniform scales, 
+        // so we need to compute the normal matrix and use it to transform the normals instead.
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(transform))); 
     
         int startTri = static_cast<int>(triangles.size()); 
         glm::vec3 aabbMin(FLT_MAX);
         glm::vec3 aabbMax(-FLT_MAX);
+
+
+        int primMatId = materialId; // fall back
+        if(prim.material >= 0 && prim.material < (int)gltfMatToMaterial.size())
+        {
+            int mapped = gltfMatToMaterial[prim.material];
+            if(mapped >= 0)
+            {
+                primMatId = mapped;
+            }
+        }
+
 
         /**
          * @param i0, i1, i2: the vertex indices of the triangle to push. These should be used to read the vertex positions from the POSITION accessor.
@@ -224,16 +347,43 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
             glm::vec3 p1 = glm::vec3(transform * glm::vec4(readVec3Accessor(model, posAccessorIndex, i1), 1.0f));
             glm::vec3 p2 = glm::vec3(transform * glm::vec4(readVec3Accessor(model, posAccessorIndex, i2), 1.0f));
 
-            glm::vec3 n = glm::normalize(glm::cross(p1 - p0, p2 - p0)); // compute the triangle normal
+            glm::vec3 faceN = glm::normalize(glm::cross(p1 - p0, p2 - p0)); // compute the triangle normal
+
+            // fall back to face normal if there are no vertex normals
+            glm::vec3 n0 = faceN;
+            glm::vec3 n1 = faceN;
+            glm::vec3 n2 = faceN;
+
+            // If the primitive has vertex normals, read them and transform them using the normal matrix. Otherwise, use the face normal for all three vertices.
+            if (hasNormals)
+            {
+                n0 = glm::normalize(normalMatrix * readVec3Accessor(model, normAccessorIndex, i0));
+                n1 = glm::normalize(normalMatrix * readVec3Accessor(model, normAccessorIndex, i1));
+                n2 = glm::normalize(normalMatrix * readVec3Accessor(model, normAccessorIndex, i2));
+            }
+
+            // If the primitive has texture coordinates, read them. Otherwise, use (0, 0) for all vertices.
+            glm::vec2 uv0(0.0f);
+            glm::vec2 uv1(0.0f);
+            glm::vec2 uv2(0.0f);
+            if (hasTexcoords)
+            {
+                uv0 = readVec2Accessor(model, uvAccessorIndex, i0);
+                uv1 = readVec2Accessor(model, uvAccessorIndex, i1);
+                uv2 = readVec2Accessor(model, uvAccessorIndex, i2);
+            }
 
             Triangle tri{}; // create a new triangle
             tri.v0 = p0;
             tri.v1 = p1;
             tri.v2 = p2;
-            tri.n0 = n;
-            tri.n1 = n;
-            tri.n2 = n;
-            tri.materialId = materialId; // set the material ID for the triangle
+            tri.n0 = n0;
+            tri.n1 = n1;
+            tri.n2 = n2;
+            tri.uv0 = uv0;
+            tri.uv1 = uv1;
+            tri.uv2 = uv2;
+            tri.materialId = primMatId; // set the material ID for the triangle
             triangles.push_back(tri); // push the triangle into the triangles vector
 
             // Update the AABB for this triangle
@@ -349,6 +499,7 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
 
 
     tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
 
 }
 
