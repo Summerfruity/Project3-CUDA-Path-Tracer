@@ -91,6 +91,25 @@ struct Material
 
     // Emission strength. If > 0, the material acts like a light source.
     float emittance;
+
+    // Texture indices into Scene::textures. -1 means no texture.
+    int baseColorTextureId;
+    int emissiveTextureId;
+
+    // glTF alpha and sidedness controls.
+    // alphaMode: 0 = OPAQUE, 1 = MASK, 2 = BLEND.
+    int alphaMode;
+    float alphaCutoff;
+    int doubleSided;
+    float baseAlpha;
+};
+
+struct TextureData
+{
+    int width;
+    int height;
+    int channels;
+    std::vector<glm::vec3> pixels;
 };
 
 struct Camera
