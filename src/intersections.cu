@@ -190,8 +190,8 @@ __host__ __device__ float triangleIntersectionTest(
     // uv interpolation
     uv = w * tri.uv0 + u * tri.uv1 + v * tri.uv2;
 
-
-    return t;
+    // Return Euclidean distance to match box/sphere intersection semantics.
+    return glm::length(r.origin - intersectionPoint);
 }
 
 
@@ -259,7 +259,8 @@ __host__ __device__ float aabbIntersectionTest(
         return -1.0f;
     }
 
-    // if tEnter is negative, it means the ray starts inside the box, so we should return tExit
-    return (tEnter > 0.0f) ? tEnter : tExit;
+    // Always return the nearest valid intersection distance.
+    // If tEnter is negative (ray starts inside the box), tNear == 0, which is a valid hit.
+    return tNear;
 
 }
