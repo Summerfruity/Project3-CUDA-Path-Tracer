@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <stb_image.h>
 
 using namespace std;
 using json = nlohmann::json;
@@ -152,7 +153,43 @@ namespace
      * and other relevant properties from the tg3_material 
      * and populates a Material struct that can be used in our path tracer.
      */
-    static Material convertGltfMaterial(const tg3_material& gm)
+    static int loadGltfTexture(const tg3_model& model, int textureIndex, const std::filesystem::path& gltfFilePath, std::vector<TextureData>& textures)
+    {
+        if (textureIndex < 0 || textureIndex >= (int)model.textures_count)
+        {
+            return -1;
+        }
+        const tg3_texture& tex = model.textures[textureIndex];
+        if (tex.source < 0 || tex.source >= (int)model.images_count)
+        {
+            return -1;
+        }
+        const tg3_image& img = model.images[tex.source];
+        if (!img.uri.data || img.uri.len == 0)
+        {
+            return -1;
+        }
+        std::filesystem::path imagePath = gltfFilePath.parent_path() / std::string(img.uri.data, img.uri.len);
+        int w = 0, h = 0, ch = 0;
+        unsigned char* data = stbi_load(imagePath.string().c_str(), &w, &h, &ch, 3);
+        if (!data)
+        {
+            std::cerr << "Failed to load texture image: " << imagePath << std::endl;
+            return -1;
+        }
+        TextureData t{};
+        t.width = w; t.height = h; t.channels = 3;
+        t.pixels.resize((size_t)w * (size_t)h);
+        for (int i = 0; i < w * h; ++i)
+        {
+            t.pixels[i] = glm::vec3(data[3 * i + 0], data[3 * i + 1], data[3 * i + 2]) / 255.0f;
+        }
+        stbi_image_free(data);
+        textures.push_back(std::move(t));
+        return (int)textures.size() - 1;
+    }
+
+    static Material convertGltfMaterial(const tg3_model& model, const tg3_material& gm, const std::filesystem::path& gltfFilePath, std::vector<TextureData>& textures)
     {
         Material m{};
 
@@ -171,6 +208,12 @@ namespace
         roughness = glm::clamp(roughness, 0.0f, 1.0f);
 
         m.color = baseColor;
+        m.baseColorTextureId = -1;
+        m.emissiveTextureId = -1;
+        m.alphaMode = 0;
+        m.alphaCutoff = static_cast<float>(gm.alpha_cutoff);
+        m.doubleSided = gm.double_sided ? 1 : 0;
+        m.baseAlpha = static_cast<float>(gm.pbr_metallic_roughness.base_color_factor[3]);
         m.specular.color = glm::mix(glm::vec3(0.04f), baseColor, metallic);
         m.specular.exponent = roughness;
         m.hasReflective = metallic;
@@ -183,6 +226,27 @@ namespace
             m.hasReflective = 0.0f;
         } else {
             m.emittance = 0.0f;
+        }
+        if (gm.pbr_metallic_roughness.base_color_texture.index >= 0)
+        {
+            m.baseColorTextureId = loadGltfTexture(model, gm.pbr_metallic_roughness.base_color_texture.index, gltfFilePath, textures);
+        }
+        if (gm.emissive_texture.index >= 0)
+        {
+            m.emissiveTextureId = loadGltfTexture(model, gm.emissive_texture.index, gltfFilePath, textures);
+        }
+
+        if (gm.alpha_mode.data)
+        {
+            std::string alphaMode(gm.alpha_mode.data, gm.alpha_mode.len);
+            if (alphaMode == "MASK")
+            {
+                m.alphaMode = 1;
+            }
+            else if (alphaMode == "BLEND")
+            {
+                m.alphaMode = 2;
+            }
         }
         return m;
         
@@ -253,7 +317,7 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
 
     for(int i = 0; i < model.materials_count; ++i)
     {
-        materials.push_back(convertGltfMaterial(model.materials[i]));
+        materials.push_back(convertGltfMaterial(model, model.materials[i], gltfPath, textures));
         gltfMatToMaterial[i] = materialBase + i;
     }
     
@@ -272,6 +336,7 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
         // Only process triangles for now
         if (prim.mode != TG3_MODE_TRIANGLES)
         {
+            std::cerr << "Skipping non-triangle primitive mode: " << prim.mode << std::endl;
             return;
         }
 
@@ -342,12 +407,46 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
          */
         auto pushTriangle = [&](uint32_t i0, uint32_t i1, uint32_t i2)
         {
+            if (i0 >= posAcc.count || i1 >= posAcc.count || i2 >= posAcc.count)
+            {
+                std::cerr << "Skipping triangle with out-of-range POSITION indices." << std::endl;
+                return;
+            }
+
+            if (hasNormals)
+            {
+                const tg3_accessor& normAcc = model.accessors[normAccessorIndex];
+                if (i0 >= normAcc.count || i1 >= normAcc.count || i2 >= normAcc.count)
+                {
+                    std::cerr << "Skipping triangle with out-of-range NORMAL indices." << std::endl;
+                    return;
+                }
+            }
+
+            if (hasTexcoords)
+            {
+                const tg3_accessor& uvAcc = model.accessors[uvAccessorIndex];
+                if (i0 >= uvAcc.count || i1 >= uvAcc.count || i2 >= uvAcc.count)
+                {
+                    std::cerr << "Skipping triangle with out-of-range TEXCOORD_0 indices." << std::endl;
+                    return;
+                }
+            }
+
             // Read the vertex positions and apply the object transform
             glm::vec3 p0 = glm::vec3(transform * glm::vec4(readVec3Accessor(model, posAccessorIndex, i0), 1.0f));
             glm::vec3 p1 = glm::vec3(transform * glm::vec4(readVec3Accessor(model, posAccessorIndex, i1), 1.0f));
             glm::vec3 p2 = glm::vec3(transform * glm::vec4(readVec3Accessor(model, posAccessorIndex, i2), 1.0f));
 
-            glm::vec3 faceN = glm::normalize(glm::cross(p1 - p0, p2 - p0)); // compute the triangle normal
+            glm::vec3 crossN = glm::cross(p1 - p0, p2 - p0);
+            float crossLen = glm::length(crossN);
+            if (crossLen < 1e-12f)
+            {
+                // Degenerate triangle, skip to avoid NaN normals.
+                return;
+            }
+
+            glm::vec3 faceN = crossN / crossLen; // compute the triangle normal
 
             // fall back to face normal if there are no vertex normals
             glm::vec3 n0 = faceN;
@@ -475,6 +574,7 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
 
         for (uint32_t i = 0; i < node.children_count; ++i)
         {
+            // Keep parentTransform in glTF node-local space; objectTransform is applied exactly once above.
             traverseNode(node.children[i], nodeTransform);
         }
     };
@@ -514,6 +614,12 @@ void Scene::loadFromJSON(const std::string& jsonName)
         const auto& name = item.key();
         const auto& p = item.value();
         Material newMaterial{};
+        newMaterial.baseColorTextureId = -1;
+        newMaterial.emissiveTextureId = -1;
+        newMaterial.alphaMode = 0;
+        newMaterial.alphaCutoff = 0.5f;
+        newMaterial.doubleSided = 0;
+        newMaterial.baseAlpha = 1.0f;
         // TODO: handle materials loading differently
         if (p["TYPE"] == "Diffuse")
         {
@@ -647,11 +753,10 @@ void Scene::loadFromJSON(const std::string& jsonName)
     float fovx = (atan(xscaled) * 180) / PI;
     camera.fov = glm::vec2(fovx, fovy);
 
+    camera.view = glm::normalize(camera.lookAt - camera.position);
     camera.right = glm::normalize(glm::cross(camera.view, camera.up));
     camera.pixelLength = glm::vec2(2 * xscaled / (float)camera.resolution.x,
         2 * yscaled / (float)camera.resolution.y);
-
-    camera.view = glm::normalize(camera.lookAt - camera.position);
 
     //set up render camera stuff
     int arraylen = camera.resolution.x * camera.resolution.y;

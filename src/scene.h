@@ -16,5 +16,6 @@ public:
 
     std::vector<Geom> geoms;
     std::vector<Material> materials;
+    std::vector<TextureData> textures;
     RenderState state;
 };

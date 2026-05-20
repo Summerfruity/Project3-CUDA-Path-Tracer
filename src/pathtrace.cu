@@ -10,6 +10,8 @@
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
+#include <vector>
+#include <algorithm>
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -106,6 +108,11 @@ static int* dev_terminatedCount = NULL;
 static int* dev_materialSortKeys = NULL;
 static Triangle* dev_triangles = NULL;
 static MeshRange* dev_meshRanges = NULL; // the range of triangles and AABB of each mash/primitive
+static glm::vec3* dev_texturePixels = NULL;
+static int* dev_textureOffsets = NULL;
+static int* dev_textureWidths = NULL;
+static int* dev_textureHeights = NULL;
+static int dev_textureCount = 0;
 
 enum MaterialTypeBucket
 {
@@ -162,6 +169,36 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
+    dev_textureCount = static_cast<int>(scene->textures.size());
+    if (dev_textureCount > 0)
+    {
+        std::vector<int> offsets(dev_textureCount, 0);
+        std::vector<int> widths(dev_textureCount, 0);
+        std::vector<int> heights(dev_textureCount, 0);
+        size_t totalPixels = 0;
+        for (int i = 0; i < dev_textureCount; ++i)
+        {
+            offsets[i] = static_cast<int>(totalPixels);
+            widths[i] = scene->textures[i].width;
+            heights[i] = scene->textures[i].height;
+            totalPixels += scene->textures[i].pixels.size();
+        }
+        std::vector<glm::vec3> packed(totalPixels);
+        for (int i = 0; i < dev_textureCount; ++i)
+        {
+            std::copy(scene->textures[i].pixels.begin(), scene->textures[i].pixels.end(),
+                      packed.begin() + offsets[i]);
+        }
+        cudaMalloc(&dev_texturePixels, totalPixels * sizeof(glm::vec3));
+        cudaMemcpy(dev_texturePixels, packed.data(), totalPixels * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+        cudaMalloc(&dev_textureOffsets, dev_textureCount * sizeof(int));
+        cudaMalloc(&dev_textureWidths, dev_textureCount * sizeof(int));
+        cudaMalloc(&dev_textureHeights, dev_textureCount * sizeof(int));
+        cudaMemcpy(dev_textureOffsets, offsets.data(), dev_textureCount * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_textureWidths, widths.data(), dev_textureCount * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_textureHeights, heights.data(), dev_textureCount * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
@@ -189,6 +226,10 @@ void pathtraceFree()
     cudaFree(dev_geoms);
     cudaFree(dev_triangles);
     cudaFree(dev_meshRanges);
+    cudaFree(dev_texturePixels);
+    cudaFree(dev_textureOffsets);
+    cudaFree(dev_textureWidths);
+    cudaFree(dev_textureHeights);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
     cudaFree(dev_paths_compact);
@@ -534,7 +575,12 @@ __global__ void shadeFakeMaterial(
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
-    Material* materials)
+    Material* materials,
+    glm::vec3* texturePixels,
+    int* textureOffsets,
+    int* textureWidths,
+    int* textureHeights,
+    int textureCount)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths)
@@ -554,6 +600,70 @@ __global__ void shadeFakeMaterial(
 
             Material material = materials[intersection.materialId];
             glm::vec3 materialColor = material.color;
+            float materialAlpha = glm::clamp(material.baseAlpha, 0.0f, 1.0f);
+
+            // Back-face handling for glTF doubleSided.
+            if (material.doubleSided == 0 && !intersection.outside)
+            {
+                pathSegments[idx].color += pathSegments[idx].throughput * BACKGROUND_COLOR;
+                pathSegments[idx].remainingBounces = 0;
+                return;
+            }
+            if (material.baseColorTextureId >= 0 && material.baseColorTextureId < textureCount)
+            {
+                int tid = material.baseColorTextureId;
+                int w = textureWidths[tid];
+                int h = textureHeights[tid];
+                if (w > 0 && h > 0)
+                {
+                    float u = intersection.uv.x - floorf(intersection.uv.x);
+                    float v = intersection.uv.y - floorf(intersection.uv.y);
+                    int x = glm::clamp((int)(u * (w - 1)), 0, w - 1);
+                    int y = glm::clamp((int)((1.0f - v) * (h - 1)), 0, h - 1);
+                    glm::vec3 texel = texturePixels[textureOffsets[tid] + y * w + x];
+                    materialColor *= texel;
+                    material.color = materialColor;
+                }
+            }
+
+
+            if (material.alphaMode == 1)
+            {
+                // MASK: cutout opacity.
+                if (materialAlpha < material.alphaCutoff)
+                {
+                    pathSegments[idx].color += pathSegments[idx].throughput * BACKGROUND_COLOR;
+                    pathSegments[idx].remainingBounces = 0;
+                    return;
+                }
+            }
+            else if (material.alphaMode == 2)
+            {
+                // BLEND: treat as probabilistic pass-through.
+                thrust::uniform_real_distribution<float> u01(0, 1);
+                float xi = u01(rng);
+                if (xi > materialAlpha)
+                {
+                    pathSegments[idx].ray.origin = pathSegments[idx].ray.origin + glm::normalize(pathSegments[idx].ray.direction) * (intersection.t + EPSILON);
+                    pathSegments[idx].remainingBounces--;
+                    return;
+                }
+            }
+
+            if (material.emissiveTextureId >= 0 && material.emissiveTextureId < textureCount && material.emittance > 0.0f)
+            {
+                int tid = material.emissiveTextureId;
+                int w = textureWidths[tid];
+                int h = textureHeights[tid];
+                if (w > 0 && h > 0)
+                {
+                    float u = intersection.uv.x - floorf(intersection.uv.x);
+                    float v = intersection.uv.y - floorf(intersection.uv.y);
+                    int x = glm::clamp((int)(u * (w - 1)), 0, w - 1);
+                    int y = glm::clamp((int)((1.0f - v) * (h - 1)), 0, h - 1);
+                    materialColor = texturePixels[textureOffsets[tid] + y * w + x];
+                }
+            }
 
             // If the material indicates that the object was a light, "light" the ray
             if (material.emittance > 0.0f) {
@@ -732,7 +842,12 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             num_paths,
             dev_intersections,
             dev_paths,
-            dev_materials
+            dev_materials,
+            dev_texturePixels,
+            dev_textureOffsets,
+            dev_textureWidths,
+            dev_textureHeights,
+            dev_textureCount
         );
 
         // gather terminated paths to add their contribution to the image and reset their color to black before compaction
