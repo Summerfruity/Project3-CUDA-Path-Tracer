@@ -171,7 +171,8 @@ namespace
         }
         std::filesystem::path imagePath = gltfFilePath.parent_path() / std::string(img.uri.data, img.uri.len);
         int w = 0, h = 0, ch = 0;
-        unsigned char* data = stbi_load(imagePath.string().c_str(), &w, &h, &ch, 3);
+        std::string imagePathStr = imagePath.string();
+        unsigned char* data = stbi_load(imagePathStr.c_str(), &w, &h, &ch, 3);
         if (!data)
         {
             std::cerr << "Failed to load texture image: " << imagePath << std::endl;

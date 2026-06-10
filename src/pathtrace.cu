@@ -391,13 +391,13 @@ __global__ void computeIntersections(
     if (path_index < num_paths)
     {
         // get the path segment for this thread
-        PathSegment pathSegment = pathSegments[path_index];
+        const PathSegment& pathSegment = pathSegments[path_index];
 
         if(pathSegment.remainingBounces <= 0) {
             return;
         }
 
-        float t; // distance along ray to intersection
+        float t = -1.0f; // distance along ray to intersection; < 0 means no hit
         glm::vec3 intersect_point; // point of intersection
         glm::vec3 surfaceNormal;
         glm::vec3 geometricNormal;
@@ -419,6 +419,7 @@ __global__ void computeIntersections(
         for (int i = 0; i < geoms_size; i++)
         {
             Geom& geom = geoms[i];
+            t = -1.0f;
 
             if (geom.type == CUBE)
             {
@@ -440,6 +441,7 @@ __global__ void computeIntersections(
                 surfaceNormal = tmp_surfaceNormal;
                 geometricNormal = tmp_geometricNormal;
                 closest_outside = outside;
+                hit_from_triangle = false;
                 uv = glm::vec2(0.0f);
             }
         }
@@ -603,7 +605,9 @@ __global__ void shadeFakeMaterial(
             float materialAlpha = glm::clamp(material.baseAlpha, 0.0f, 1.0f);
 
             // Back-face handling for glTF doubleSided.
-            if (material.doubleSided == 0 && !intersection.outside)
+            // Refractive materials must allow rays to exit from the inside,
+            // so skip this check for them.
+            if (material.doubleSided == 0 && !intersection.outside && material.hasRefractive == 0.0f)
             {
                 pathSegments[idx].color += pathSegments[idx].throughput * BACKGROUND_COLOR;
                 pathSegments[idx].remainingBounces = 0;
@@ -629,23 +633,26 @@ __global__ void shadeFakeMaterial(
 
             if (material.alphaMode == 1)
             {
-                // MASK: cutout opacity.
+                // MASK: cutout opacity. A discarded fragment is transparent, so keep
+                // tracing the same ray just beyond this surface instead of ending it
+                // against the background.
                 if (materialAlpha < material.alphaCutoff)
                 {
-                    pathSegments[idx].color += pathSegments[idx].throughput * BACKGROUND_COLOR;
-                    pathSegments[idx].remainingBounces = 0;
+                    pathSegments[idx].ray.origin +=
+                        glm::normalize(pathSegments[idx].ray.direction) * (intersection.t + EPSILON);
                     return;
                 }
             }
             else if (material.alphaMode == 2)
             {
-                // BLEND: treat as probabilistic pass-through.
+                // BLEND: approximate partial coverage with a stochastic pass-through.
+                // Transparent samples should not consume a scattering bounce.
                 thrust::uniform_real_distribution<float> u01(0, 1);
                 float xi = u01(rng);
                 if (xi > materialAlpha)
                 {
-                    pathSegments[idx].ray.origin = pathSegments[idx].ray.origin + glm::normalize(pathSegments[idx].ray.direction) * (intersection.t + EPSILON);
-                    pathSegments[idx].remainingBounces--;
+                    pathSegments[idx].ray.origin +=
+                        glm::normalize(pathSegments[idx].ray.direction) * (intersection.t + EPSILON);
                     return;
                 }
             }
