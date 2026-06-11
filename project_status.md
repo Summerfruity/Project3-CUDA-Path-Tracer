@@ -211,10 +211,10 @@ In `generateRayFromCamera`:
 
 ```bash
 # JSON scene (Cornell Box)
-./cis565_path_tracer scenes/cornell.json
+.\build\bin\release\cis565_path_tracer.exe .\scenes\cornell.json    
 
 # glTF scene
-./cis565_path_tracer scenes/render_gltf.json
+.\build\bin\release\cis565_path_tracer.exe .\scenes\render_gltf.json
 ```
 
 **ImGui Toggles** (available at runtime):
