@@ -28,6 +28,7 @@ public:
     int compactionMinPaths = 4096;
     bool enableAntialiasing = true;
     bool enableMeshAabbCulling = true;
+    bool enableMeshBvh = true;
 };
 
 namespace utilityCore

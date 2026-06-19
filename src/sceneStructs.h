@@ -24,12 +24,27 @@ struct Triangle
     int materialId;
 };
 
+struct BVHNode
+{
+    // aabb + left and right node
+    glm::vec3 aabbMin;
+    int left;         // leaf: global triStartIndex; internal: left child node index
+    glm::vec3 aabbMax;
+    int right;        // leaf: triCount; internal: right child node index
+    int isLeaf;
+    int pad[3];       // memory alignment : 48 Bytes
+
+};
+
 struct MeshRange
 {
     int triStartIndex;
     int triCount;
     glm::vec3 aabbMin;
     glm::vec3 aabbMax;
+    int bvhRootIndex;    // -1 means this MeshRange didn't build BVH
+    int bvhNodeCount;    
+    int pad[2];          // memory alignment
 };
 
 

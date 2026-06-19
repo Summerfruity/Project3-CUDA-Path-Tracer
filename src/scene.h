@@ -13,6 +13,7 @@ public:
 
     std::vector<Triangle> triangles;
     std::vector<MeshRange> meshRanges;
+    std::vector<BVHNode> bvhNodes;
 
     std::vector<Geom> geoms;
     std::vector<Material> materials;

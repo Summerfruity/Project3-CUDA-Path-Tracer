@@ -38,7 +38,6 @@ __host__ __device__ inline glm::vec3 multiplyMV(glm::mat4 m, glm::vec4 v)
     return glm::vec3(m * v);
 }
 
-// CHECKITOUT
 /**
  * Test intersection between a ray and a transformed cube. Untransformed,
  * the cube ranges from -0.5 to 0.5 in each axis and is centered at the origin.
@@ -109,3 +108,24 @@ __host__ __device__ float aabbIntersectionTest(
     const MeshRange& range,
     Ray r,
     float maxT);
+
+
+__host__ __device__ float aabbIntersectionTest(
+    glm::vec3 aabbMin,
+    glm::vec3 aabbMax,
+    Ray r,
+    float maxT);
+
+__device__ bool bvhIntersectionTest(
+    const BVHNode* nodes,           // A global BVH node array (containing all nodes of the mesh).
+    int rootIndex,                  // The index of the current mesh's BVH root node in the nodes list.
+    const MeshRange& range,         // Triangle range information of the current mesh
+    const Triangle* triangles,      // Global triangle array
+    Ray r,                          // Current light
+    float& bestT,                   // The smallest t value found so far (input/output)
+    glm::vec3& bestPoint,           // Closest intersection point (output)
+    glm::vec3& bestNormal,          // The closest intersection point normal (output)
+    glm::vec3& bestGeomNormal,      // The geometric normal at the closest intersection point (output)
+    bool& bestOutside,              // Was it hit from the outside (output)?
+    int& bestMaterialId,            // material ID (output)
+    glm::vec2& bestUv);             // Nearest intersection point UV (output)

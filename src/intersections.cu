@@ -196,7 +196,8 @@ __host__ __device__ float triangleIntersectionTest(
 
 
 __host__ __device__ float aabbIntersectionTest(
-    const MeshRange& range,
+    glm::vec3 aabbMin,
+    glm::vec3 aabbMax,
     Ray r,
     float maxT)
 {
@@ -212,8 +213,8 @@ __host__ __device__ float aabbIntersectionTest(
     {
         float origin = r.origin[axis];
         float direction = dir[axis];
-        float minBox = range.aabbMin[axis];
-        float maxBox = range.aabbMax[axis];
+        float minBox = aabbMin[axis];
+        float maxBox = aabbMax[axis];
 
         if(glm::abs(direction) < PARALLEL_EPSILON)
         {
@@ -262,5 +263,130 @@ __host__ __device__ float aabbIntersectionTest(
     // Always return the nearest valid intersection distance.
     // If tEnter is negative (ray starts inside the box), tNear == 0, which is a valid hit.
     return tNear;
+
+}
+
+__host__ __device__ float aabbIntersectionTest(
+    const MeshRange& range,
+    Ray r,
+    float maxT)
+{
+    return aabbIntersectionTest(range.aabbMin, range.aabbMax, r, maxT);
+}
+
+__device__ bool bvhIntersectionTest(
+    const BVHNode* nodes,
+    int rootIndex,
+    const MeshRange& range,
+    const Triangle* triangles,
+    Ray r,
+    float& bestT,
+    glm::vec3& bestPoint,
+    glm::vec3& bestNormal,
+    glm::vec3& bestGeomNormal,
+    bool& bestOutside,
+    int& bestMaterialId,
+    glm::vec2& bestUv)
+{
+    if(rootIndex < 0) return false;
+
+    // Stack initialization
+    const int STACK_SIZE = 128;
+    int stack[STACK_SIZE];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = rootIndex;
+
+    // Main loop: while stack is not empty
+    bool hit = false;
+
+    while (stack_ptr > 0)
+    {
+        // pop the node
+        int nodeIdx = stack[--stack_ptr];
+        const BVHNode& node = nodes[nodeIdx];
+
+        // AABB Quick Removal
+        float aabbT = aabbIntersectionTest(node.aabbMin, node.aabbMax, r, bestT);
+        if(aabbT < 0.0f) continue;
+
+        // if leaf
+        if(node.isLeaf)
+        {
+            for (int i = 0; i < node.right; ++i)
+            {
+                int triIdx = range.triStartIndex + node.left + i;
+                const Triangle& tri = triangles[triIdx];
+
+                glm::vec3 tmpPoint, tmpNormal, tmpGeomNormal;
+                glm::vec2 tmpUv;
+                bool tmpOutside;
+                float t = triangleIntersectionTest(
+                    tri, r,
+                    tmpPoint, tmpNormal, tmpGeomNormal,
+                    tmpOutside, tmpUv);
+
+                if (t > 0.0f && t < bestT)
+                {
+                    bestT = t;
+                    bestPoint = tmpPoint;
+                    bestNormal = tmpNormal;
+                    bestGeomNormal = tmpGeomNormal;
+                    bestOutside = tmpOutside;
+                    bestMaterialId = tri.materialId;
+                    bestUv = tmpUv;
+                    hit = true;
+                }
+            }
+        }
+        else
+        {
+            const BVHNode& leftChild = nodes[node.left];
+            const BVHNode& rightChild = nodes[node.right];
+
+            // Test the AABB of the two child nodes to obtain the nearest entry distance.
+            float tLeft = aabbIntersectionTest(leftChild.aabbMin, leftChild.aabbMax, r, bestT);
+            float tRight = aabbIntersectionTest(rightChild.aabbMin, rightChild.aabbMax, r, bestT);
+
+            bool hitLeft  = (tLeft  >= 0.0f);
+            bool hitRight = (tRight >= 0.0f);
+
+            if (hitLeft && hitRight)
+            {
+                // If both child nodes intersect, push the farther one first, then the closer one.
+                if (stack_ptr + 2 <= STACK_SIZE)
+                {
+                    if (tLeft < tRight)
+                    {
+                        stack[stack_ptr++] = node.right;
+                        stack[stack_ptr++] = node.left;
+                    }
+                    else
+                    {
+                        stack[stack_ptr++] = node.left;
+                        stack[stack_ptr++] = node.right;
+                    }
+                }
+            }
+            else if (hitLeft)
+            {
+                if (stack_ptr + 1 <= STACK_SIZE)
+                {
+                    stack[stack_ptr++] = node.left;
+                }
+            }
+            else if (hitRight)
+            {
+                if (stack_ptr + 1 <= STACK_SIZE)
+                {
+                    stack[stack_ptr++] = node.right;
+                }
+            }
+
+        }
+    }
+    
+
+    return hit;
+
 
 }

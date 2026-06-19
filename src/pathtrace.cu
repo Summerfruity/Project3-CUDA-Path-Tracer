@@ -108,6 +108,7 @@ static int* dev_terminatedCount = NULL;
 static int* dev_materialSortKeys = NULL;
 static Triangle* dev_triangles = NULL;
 static MeshRange* dev_meshRanges = NULL; // the range of triangles and AABB of each mash/primitive
+static BVHNode* dev_bvhNodes = NULL; 
 static glm::vec3* dev_texturePixels = NULL;
 static int* dev_textureOffsets = NULL;
 static int* dev_textureWidths = NULL;
@@ -164,6 +165,17 @@ void pathtraceInit(Scene* scene)
     else 
     {
         dev_meshRanges = nullptr;
+    }
+
+    if(!scene->bvhNodes.empty())
+    {
+        cudaMalloc(&dev_bvhNodes, scene->bvhNodes.size() * sizeof(BVHNode));
+        cudaMemcpy(dev_bvhNodes, scene->bvhNodes.data(),
+                    scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
+    }
+    else
+    {
+        dev_bvhNodes = nullptr;
     }
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
@@ -237,6 +249,7 @@ void pathtraceFree()
     cudaFree(dev_scanIndices);
     cudaFree(dev_terminatedCount);
     cudaFree(dev_materialSortKeys);
+    cudaFree(dev_bvhNodes);
     StreamCompaction::Efficient::freeScanDeviceBuffer();
     pathtraceCheckCUDA("pathtraceFree", __LINE__);
 }
@@ -383,7 +396,9 @@ __global__ void computeIntersections(
     Triangle* triangles,
     MeshRange* meshRanges,
     int meshRanges_size,
+    BVHNode* bvhNodes, 
     bool enableMeshAabbCulling,
+    bool enableMeshBvh, 
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -452,7 +467,7 @@ __global__ void computeIntersections(
             const MeshRange range = meshRanges[i];
             int triCount = range.triCount;
 
-            // AABB culling
+            // The top AABB is still retained for quick removal of the entire mesh.
             if(enableMeshAabbCulling)
             {
                 float aabbT = aabbIntersectionTest(range, pathSegment.ray, t_min);
@@ -460,25 +475,44 @@ __global__ void computeIntersections(
                     continue;
             }
 
-            for(int j = 0; j < triCount; j++)
+            if (enableMeshBvh && range.bvhRootIndex >= 0 && bvhNodes != nullptr)
             {
-                const Triangle& tri = triangles[range.triStartIndex + j];
-                bool tmp_outside;
-                t = triangleIntersectionTest(tri, pathSegment.ray, tmp_intersect, 
-                                             tmp_surfaceNormal, tmp_geometricNormal, 
-                                             tmp_outside, tmp_uv);
+                bool hitTri = bvhIntersectionTest(
+                    bvhNodes, range.bvhRootIndex, range, triangles,
+                    pathSegment.ray,
+                    t_min,
+                    intersect_point, surfaceNormal, geometricNormal,
+                    closest_outside, hit_triangle_material_id, uv);
 
-                // update if hit closer                             
-                if (t > 0 && t < t_min)
+                if (hitTri)
                 {
-                    t_min = t;
-                    intersect_point = tmp_intersect;
-                    surfaceNormal = tmp_surfaceNormal;
-                    geometricNormal = tmp_geometricNormal;
-                    closest_outside = tmp_outside;
-                    hit_triangle_material_id = tri.materialId;
                     hit_from_triangle = true;
-                    uv = tmp_uv;
+                    hit_geom_index = -1;   // Ensure that subsequent material selection follows the triangle branch.
+                }
+            }
+            else
+            {
+                // fallback：brute-force 
+                for(int j = 0; j < triCount; j++)
+                {
+                    const Triangle& tri = triangles[range.triStartIndex + j];
+                    bool tmp_outside;
+                    t = triangleIntersectionTest(tri, pathSegment.ray, tmp_intersect, 
+                                                tmp_surfaceNormal, tmp_geometricNormal, 
+                                                tmp_outside, tmp_uv);
+
+                    // update if hit closer                             
+                    if (t > 0 && t < t_min)
+                    {
+                        t_min = t;
+                        intersect_point = tmp_intersect;
+                        surfaceNormal = tmp_surfaceNormal;
+                        geometricNormal = tmp_geometricNormal;
+                        closest_outside = tmp_outside;
+                        hit_triangle_material_id = tri.materialId;
+                        hit_from_triangle = true;
+                        uv = tmp_uv;
+                    }
                 }
             }
         }
@@ -737,6 +771,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     const bool ENABLE_STREAM_COMPACTION = (guiData != NULL) ? guiData->enableStreamCompaction : true;
     const bool ENABLE_ADAPTIVE_COMPACTION = (guiData != NULL) ? guiData->enableAdaptiveCompaction : true;
     const bool ENABLE_MATERIAL_TYPE_SORT = (guiData != NULL) ? guiData->enableMaterialTypeSort : false;
+    const bool ENABLE_MESH_AABB_CULLING = (guiData != NULL) ? guiData->enableMeshAabbCulling : true;
+    const bool ENABLE_MESH_BVH          = (guiData != NULL) ? guiData->enableMeshBvh : true;
     const float COMPACTION_ACTIVE_RATIO_THRESHOLD = (guiData != NULL) ? guiData->compactionActiveRatioThreshold : 0.70f;
     const int COMPACTION_MIN_PATHS = (guiData != NULL) ? guiData->compactionMinPaths : 4096;
 
@@ -801,7 +837,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_triangles,
             dev_meshRanges,
             hst_scene->meshRanges.size(),
+            dev_bvhNodes,
             ENABLE_MESH_AABB_CULLING,
+            ENABLE_MESH_BVH,
             dev_intersections
         );
         pathtraceCheckCUDA("trace one bounce", __LINE__);

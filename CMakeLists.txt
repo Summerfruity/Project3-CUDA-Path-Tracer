@@ -49,6 +49,7 @@ find_package(GLM REQUIRED)
 include_directories(${GLM_INCLUDE_DIRS})
 
 set(headers
+    src/bvh.h
     src/image.h
     src/interactions.h
     src/intersections.h
@@ -70,6 +71,7 @@ set(sources
     src/scene.cpp
     src/utilities.cpp
     src/tinygltf3_impl.cpp
+    src/bvh.cpp 
 )
 
 set(imgui_headers

@@ -3,6 +3,7 @@
 
 
 #include "utilities.h"
+#include "bvh.h"
 
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtx/string_cast.hpp>
@@ -541,6 +542,8 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
             range.triCount = triCount;
             range.aabbMin = aabbMin;
             range.aabbMax = aabbMax;
+            range.bvhRootIndex = -1;
+            range.bvhNodeCount = 0;
             meshRanges.push_back(range);
         }
 
@@ -592,12 +595,41 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
         }
     }
 
+    // ---- Build BVH for each MeshRange ----
+    const int BVH_MAX_LEAF_SIZE = 4;
+    const int BVH_MAX_DEPTH     = 32;
+    const int BVH_MIN_TRIANGLES = 16;   // Mesh values ​​smaller than this will not be BVH built.
+
+    for (auto& range : meshRanges)
+    {
+        if (range.triCount < BVH_MIN_TRIANGLES)
+        {
+            range.bvhRootIndex = -1;
+            range.bvhNodeCount = 0;
+            continue;
+        }
+
+        int globalOffset = static_cast<int>(bvhNodes.size());
+        std::vector<BVHNode> localNodes = buildBVHForRange(
+            triangles,
+            range.triStartIndex,
+            range.triCount,
+            BVH_MAX_LEAF_SIZE,
+            BVH_MAX_DEPTH,
+            globalOffset);
+
+        range.bvhRootIndex = globalOffset;
+        range.bvhNodeCount = static_cast<int>(localNodes.size());
+        bvhNodes.insert(bvhNodes.end(), localNodes.begin(), localNodes.end());
+    }
+    
 
     std::cout << "Loaded glTF: " << gltfPath
               << ", total triangles: " << triangles.size()
               << ", mesh ranges: " << meshRanges.size()
               << std::endl;
 
+    
 
     tg3_model_free(&model);
     tg3_error_stack_free(&errors);
