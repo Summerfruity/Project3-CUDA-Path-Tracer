@@ -293,6 +293,7 @@ void RenderImGui()
     uiChanged |= ImGui::Checkbox("Enable Material Type Sort", &imguiData->enableMaterialTypeSort);
     uiChanged |= ImGui::Checkbox("Enable Mesh AABB Culling", &imguiData->enableMeshAabbCulling);
     uiChanged |= ImGui::Checkbox("Enable Mesh BVH", &imguiData->enableMeshBvh);
+    uiChanged |= ImGui::Checkbox("Enable Russian Roulette", &imguiData->enableRussianRoulette);
 
     if (imguiData->enableAdaptiveCompaction) {
         uiChanged |= ImGui::SliderFloat("Compaction Active Ratio", &imguiData->compactionActiveRatioThreshold, 0.0f, 1.0f, "%.2f");

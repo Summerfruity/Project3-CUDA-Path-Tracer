@@ -10,7 +10,7 @@ CUDA Path Tracer
 
 ## Overview
 
-This project is a CUDA-based GPU path tracer capable of rendering globally-illuminated scenes with both analytic primitives (spheres and cubes) and arbitrary glTF 2.0 triangle meshes. It implements the core rendering pipeline on the GPU, including ray generation, intersection testing, BSDF evaluation, and progressive accumulation. Beyond the base requirements, the renderer features **adaptive stream compaction**, **material-type sorting**, **per-mesh AABB culling**, **per-mesh BVH acceleration**, **refraction**, **depth of field**, **texture mapping**, and full **glTF PBR material** support.
+This project is a CUDA-based GPU path tracer capable of rendering globally-illuminated scenes with both analytic primitives (spheres and cubes) and arbitrary glTF 2.0 triangle meshes. It implements the core rendering pipeline on the GPU, including ray generation, intersection testing, BSDF evaluation, and progressive accumulation. Beyond the base requirements, the renderer features **adaptive stream compaction**, **material-type sorting**, **per-mesh AABB culling**, **per-mesh BVH acceleration**, **refraction**, **depth of field**, **Russian roulette path termination**, **texture mapping**, and full **glTF PBR material** support.
 
 The implementation prioritizes interactive feedback through CUDA-OpenGL interop: the image is progressively refined while the user can toggle effects and move the camera in real time.
 
@@ -34,12 +34,13 @@ The implementation prioritizes interactive feedback through CUDA-OpenGL interop:
 | **AABB Intersection Culling** | — | ✅ | `intersections.cu::aabbIntersectionTest` — per-`MeshRange` slab test |
 | **Refraction (Glass/Water)** | :two: | ✅ | `interactions.cu::scatterRay` — Snell's law + Schlick Fresnel + TIR handling |
 | **Depth of Field** | :two: | ✅ | `pathtrace.cu::generateRayFromCamera` — thin-lens model with polar disk sampling |
+| **Russian Roulette** | :one: | ✅ | `pathtrace.cu::russianRouletteTerminate` — Veach-style stochastic termination with 1/q throughput re-weighting |
 | **Specular / Glossy Reflection** | — | ✅ | `interactions.cu::scatterRay` — perfect mirror + roughness hemisphere perturbation |
 | **Base Color Texture** | — | ✅ | `pathtrace.cu::shadeFakeMaterial` — packed GPU texture atlas via `stbi_load` |
 | **Emissive Texture** | — | ✅ | `pathtrace.cu::shadeFakeMaterial` — overrides material color for emitters |
 | **glTF Material Features** | — | ✅ | `scene.cpp::convertGltfMaterial` — `alphaMode` (OPAQUE/MASK/BLEND), `doubleSided`, `alphaCutoff` |
 
-**Total Part 2 score: 14+ points** (minimum required: 10).
+**Total Part 2 score: 15+ points** (minimum required: 10).
 
 ## Build Instructions
 
@@ -114,6 +115,7 @@ The analytics window exposes several rendering options:
 - **Enable Material Type Sort** — group rays by material behavior before shading
 - **Enable Mesh AABB Culling** — skip whole meshes whose AABB is behind the current hit
 - **Enable Mesh BVH** — use per-mesh BVH instead of brute-force triangle iteration
+- **Enable Russian Roulette** — stochastically terminate low-contribution paths to save GPU work (unbiased)
 
 ## Feature Deep Dive
 
@@ -194,6 +196,21 @@ Base color and emissive textures are loaded with `stbi_load`, packed into a sing
 
 ![Texture TODO](img/TEXTURE_TODO.png)
 
+### Russian Roulette
+
+After each scatter, `russianRouletteTerminate` offers the path to the roulette. The survival probability is `q = clamp(max(throughput.rgb), 0.05, 0.95)`:
+
+1. **Re-weight** `throughput /= q` so the estimator stays unbiased.
+2. Sample `ξ ~ U(0,1)`. If `ξ < 1 - q`, terminate the path.
+
+Expected contribution `q · (throughput / q) + (1 - q) · 0 = throughput`, so the estimator is preserved.
+
+The helper is invoked in `shadeFakeMaterial` immediately **after** `scatterRay`, which guarantees that paths that already terminated cleanly (light hit, miss, alpha discard) are not re-rolled. When disabled, the helper short-circuits and the renderer behaves exactly as it did with fixed-depth termination.
+
+Because each thread already carries its own `PathSegment`, RR on the GPU costs almost nothing — one clamp, one divide, one RNG draw per scatter — whereas a CPU implementation would have to maintain per-pixel state on the host. The biggest performance win is in closed scenes where most paths terminate on diffuse bounces; RR prunes the long tail of low-energy paths early, letting stream compaction (which also benefits) kick in sooner.
+
+![Russian Roulette TODO](img/RUSSIAN_ROULETTE_TODO.png)
+
 ## Performance Analysis
 
 All timings below were collected with Nsight on the test machine listed at the top of this README. Replace the placeholders with your actual measurements.
@@ -231,7 +248,6 @@ Material sorting reduces warp divergence in the shading kernel. The benefit is m
 
 - **No global BVH**: each `MeshRange` has its own BVH, but there is no top-level BVH across mesh ranges. Scenes with many small primitives still pay per-mesh overhead.
 - **No direct lighting / NEE**: convergence in scenes with small bright lights can be slow.
-- **No Russian roulette**: paths terminate only at a fixed maximum depth.
 - **Glossy energy conservation**: the roughness blur does not currently divide by the sampling PDF, leading to a slight brightness bias.
 - **No tone mapping / gamma correction**: linear radiance is written directly to the PBO.
 

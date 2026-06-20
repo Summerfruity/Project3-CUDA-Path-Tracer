@@ -380,6 +380,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
+        segment.throughputWeight = 1.0f;
     }
 }
 
@@ -595,17 +596,43 @@ const Material* materials, int num_paths, int* materialSortKeys)
 }
 
 
+/**
+ * Russian Roulette path termination (Veach-style, PBRTv3 13.7).
+ *
+ * Survival probability: q = clamp(maxComponent(throughput), 0.05, 0.95).
+ *   - Floor 0.05 prevents divide-by-zero on near-zero throughput.
+ *   - Ceiling 0.95 avoids aggressively killing moderate paths.
+ *
+ * The throughput is re-weighted to throughput / q BEFORE the stochastic
+ * termination test so that the estimator stays unbiased:
+ *
+ *   E[L] = q * (throughput / q) + (1 - q) * 0 = throughput
+ *
+ * Returns true if the path should be terminated.
+ */
+__device__ bool russianRouletteTerminate(
+    PathSegment& pathSegment,
+    thrust::default_random_engine& rng,
+    bool enableRR)
+{
+    if (!enableRR)
+    {
+        return false;
+    }
+
+    float maxComp = glm::max(pathSegment.throughput.x,
+                    glm::max(pathSegment.throughput.y,
+                             pathSegment.throughput.z));
+
+    float q = glm::clamp(maxComp, 0.05f, 0.95f);
+
+    pathSegment.throughput /= q;
+
+    thrust::uniform_real_distribution<float> u01(0, 1);
+    return u01(rng) < (1.0f - q);
+}
 
 
-// LOOK: "fake" shader demonstrating what you might do with the info in
-// a ShadeableIntersection, as well as how to use thrust's random number
-// generator. Observe that since the thrust random number generator basically
-// adds "noise" to the iteration, the image should start off noisy and get
-// cleaner as more iterations are computed.
-//
-// Note that this shader does NOT do a BSDF evaluation!
-// Your shaders should handle that - this can allow techniques such as
-// bump mapping.
 __global__ void shadeFakeMaterial(
     int iter,
     int num_paths,
@@ -616,7 +643,8 @@ __global__ void shadeFakeMaterial(
     int* textureOffsets,
     int* textureWidths,
     int* textureHeights,
-    int textureCount)
+    int textureCount,
+    bool enableRussianRoulette)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths)
@@ -707,22 +735,39 @@ __global__ void shadeFakeMaterial(
             }
 
             // If the material indicates that the object was a light, "light" the ray
-            if (material.emittance > 0.0f) {
+            // and terminate the path. glTF materials with a non-zero
+            // emissiveFactor are NOT treated as terminator lights — their
+            // emissive contribution is added below and the path continues with
+            // diffuse / specular shading so the body still receives lighting.
+            if (material.isLight && material.emittance > 0.0f) {
                 pathSegments[idx].color += pathSegments[idx].throughput * (materialColor * material.emittance);
-                pathSegments[idx].remainingBounces = 0; 
+                pathSegments[idx].remainingBounces = 0;
+                return;
             }
-            // Otherwise, do some pseudo-lighting computation. This is actually more
-            // like what you would expect from shading in a rasterizer like OpenGL.
-            // TODO: replace this! you should be able to start with basically a one-liner
-            else {
-                scatterRay(
-                    pathSegments[idx], // pass by ref, modify it in place
-                    pathSegments[idx].ray.origin + glm::normalize(pathSegments[idx].ray.direction) * intersection.t,
-                    intersection.surfaceNormal,
-                    intersection.geometricNormal,
-                    intersection.outside,
-                    material,
-                    rng);
+            if (material.emittance > 0.0f)
+            {
+                // Non-terminating emissive contribution (e.g. glTF material
+                // with emissive texture). Add it to the radiance and continue
+                // scattering as usual so the surface still receives lighting.
+                pathSegments[idx].color += pathSegments[idx].throughput * (materialColor * material.emittance);
+            }
+
+            scatterRay(
+                pathSegments[idx], // pass by ref, modify it in place
+                pathSegments[idx].ray.origin + glm::normalize(pathSegments[idx].ray.direction) * intersection.t,
+                intersection.surfaceNormal,
+                intersection.geometricNormal,
+                intersection.outside,
+                material,
+                rng);
+
+            // Russian Roulette: after the first few bounces, stochastically
+            // kill paths whose throughput has become very small. The
+            // throughput has already been re-weighted inside the helper to
+            // keep the estimator unbiased.
+            if (russianRouletteTerminate(pathSegments[idx], rng, enableRussianRoulette))
+            {
+                pathSegments[idx].remainingBounces = 0;
             }
             // If there was no intersection, color the ray black.
             // Lots of renderers use 4 channel color, RGBA, where A = alpha, often
@@ -773,6 +818,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     const bool ENABLE_MATERIAL_TYPE_SORT = (guiData != NULL) ? guiData->enableMaterialTypeSort : false;
     const bool ENABLE_MESH_AABB_CULLING = (guiData != NULL) ? guiData->enableMeshAabbCulling : true;
     const bool ENABLE_MESH_BVH          = (guiData != NULL) ? guiData->enableMeshBvh : true;
+    const bool ENABLE_RUSSIAN_ROULETTE  = (guiData != NULL) ? guiData->enableRussianRoulette : false;
     const float COMPACTION_ACTIVE_RATIO_THRESHOLD = (guiData != NULL) ? guiData->compactionActiveRatioThreshold : 0.70f;
     const int COMPACTION_MIN_PATHS = (guiData != NULL) ? guiData->compactionMinPaths : 4096;
 
@@ -892,7 +938,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_textureOffsets,
             dev_textureWidths,
             dev_textureHeights,
-            dev_textureCount
+            dev_textureCount,
+            ENABLE_RUSSIAN_ROULETTE
         );
 
         // gather terminated paths to add their contribution to the image and reset their color to black before compaction

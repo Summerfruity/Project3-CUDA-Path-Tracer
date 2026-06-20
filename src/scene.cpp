@@ -220,15 +220,15 @@ namespace
         m.specular.exponent = roughness;
         m.hasReflective = metallic;
         m.hasRefractive = 0.0f;
+        m.isLight = 0;
 
+        // glTF emissiveFactor alone does not mark a material as a terminator
+        // light; we keep the base color / metallic-roughness path intact and
+        // only use emittance as a multiplier for the (optional) emissive
+        // texture sample. True lights in this renderer come from JSON
+        // "Emitting" materials which set isLight = 1.
         float emMax = glm::max(emissive.x, glm::max(emissive.y, emissive.z));
-        if (emMax > 0.0f) {
-            m.color = emissive / emMax;
-            m.emittance = emMax;
-            m.hasReflective = 0.0f;
-        } else {
-            m.emittance = 0.0f;
-        }
+        m.emittance = emMax;
         if (gm.pbr_metallic_roughness.base_color_texture.index >= 0)
         {
             m.baseColorTextureId = loadGltfTexture(model, gm.pbr_metallic_roughness.base_color_texture.index, gltfFilePath, textures);
@@ -670,6 +670,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
             newMaterial.emittance = p["EMITTANCE"];
             newMaterial.hasReflective = 0.f;
             newMaterial.hasRefractive = 0.f;
+            newMaterial.isLight = 1;
         }
         else if (p["TYPE"] == "Specular")
         {

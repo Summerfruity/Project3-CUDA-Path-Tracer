@@ -117,6 +117,12 @@ struct Material
     float alphaCutoff;
     int doubleSided;
     float baseAlpha;
+
+    // True only for JSON-defined Emitting materials. glTF materials never
+    // terminate the path purely on the basis of an emissiveFactor; instead,
+    // their emissive contribution is added to the throughput and the path
+    // continues with normal diffuse / specular shading.
+    int isLight;
 };
 
 struct TextureData
@@ -197,6 +203,11 @@ struct PathSegment
 
     // How many more bounces this path is allowed to take.
     int remainingBounces;
+
+    // Cached throughput weight from the last scatter, used by Russian Roulette.
+    // When RR is disabled this stays at 1.0 and the path is never stochastically
+    // terminated by RR.
+    float throughputWeight;
 };
 
 // Use with a corresponding PathSegment to do:

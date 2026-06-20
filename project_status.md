@@ -33,6 +33,7 @@ This project implements a fully functional GPU path tracer using CUDA. The rende
 | **Refraction (Glass/Water)** | :two: | ✅ | `interactions.cu::scatterRay` | Snell's law + Schlick Fresnel + TIR handling |
 | **Depth of Field** | :two: | ✅ | `pathtrace.cu::generateRayFromCamera` | Thin-lens model, polar disk sampling |
 | **Specular / Glossy Reflection** | — | ✅ | `interactions.cu::scatterRay` | Perfect mirror + roughness hemisphere perturbation |
+| **Russian Roulette** | :one: | ✅ | `pathtrace.cu::russianRouletteTerminate` | Veach-style RR (PBRTv3 13.7): survival probability = clamp(max(throughput), 0.05, 0.95); throughput re-weighted by 1/q to keep the estimator unbiased |
 | **BVH Acceleration (per-mesh)** | :six: | ✅ | `bvh.cpp` + `intersections.cu::bvhIntersectionTest` | Midpoint-split BVH built on CPU; iterative GPU traversal with near-first stack |
 | **Base Color Texture** | — | ✅ | `pathtrace.cu::shadeFakeMaterial` | `stbi_load` → packed GPU texture atlas |
 | **Emissive Texture** | — | ✅ | `pathtrace.cu::shadeFakeMaterial` | Overrides material color for light emitters |
@@ -43,7 +44,7 @@ This project implements a fully functional GPU path tracer using CUDA. The rende
 | Feature | Points | Why Not |
 |---------|--------|---------|
 | Bump / Normal Mapping | :five:/:six: | Infrastructure ready (normals + UVs exist), but TBN matrix not computed |
-| Russian Roulette | :one: | Fixed `traceDepth` termination only |
+| Russian Roulette | :one: | ✅ Implemented (Veach-style); throughput re-weighted by 1/q to remain unbiased |
 | Direct Lighting (NEE) | :two: | Standard path tracing only; no explicit light sampling per bounce |
 | Wavefront Path Tracing | :six: | Single mega-kernel (`shadeFakeMaterial`) instead of material-specific kernels |
 | OIDN Denoiser | :three: | No CPU denoiser integration |
@@ -217,7 +218,7 @@ In `generateRayFromCamera`:
 | Energy conservation (glossy) | Low | Roughness blur uses hemisphere sampling without dividing by the sample PDF. Slightly biased brightness. |
 | No gamma correction | Low | `sendImageToPBO` writes linear radiance directly; output may look dark on standard displays without post-process tone mapping. |
 | Alpha from texture | Low | `stbi_load` requests 3 channels, so texture alpha is unavailable for `alphaMode == MASK`. |
-| No Russian Roulette | Low | Fixed-depth termination only; some paths could terminate earlier without bias. |
+| No Russian Roulette | Low | Fixed-depth termination only; some paths could terminate earlier without bias. *(Resolved: Russian Roulette now implemented; toggleable via ImGui.)* |
 | No Direct Lighting | Medium | Standard uni-directional path tracing; scenes with small bright lights converge slowly. |
 
 ---
@@ -239,7 +240,42 @@ In `generateRayFromCamera`:
 - Enable Material Type Sort
 - Enable Mesh AABB Culling
 - Enable Mesh BVH
+- Enable Russian Roulette
 
 ---
 
-*Last updated: 2026-06-19*
+## 6. Russian Roulette
+
+Russian Roulette (RR) terminates low-contribution paths stochastically to reduce wasted GPU work, while keeping the Monte Carlo estimator unbiased (Veach-style, PBRTv3 §13.7).
+
+### Algorithm
+
+After each `scatterRay` in `shadeFakeMaterial`, the path is offered to the roulette:
+
+1. Compute `q = clamp(max(throughput.r, throughput.g, throughput.b), 0.05, 0.95)`.
+   - **Floor 0.05** prevents divide-by-zero on near-zero throughput.
+   - **Ceiling 0.95** avoids aggressively killing moderate paths.
+2. **Re-weight throughput** to keep the estimator unbiased: `throughput /= q`.
+3. Sample `ξ ~ U(0,1)`. If `ξ < 1 - q`, terminate the path (`remainingBounces = 0`).
+
+The expected throughput contribution after RR is:
+
+  `E[L] = q · (original_throughput / q) + (1 - q) · 0 = original_throughput`
+
+so the estimator remains unbiased.
+
+### Implementation Details
+
+- Lives in `src/pathtrace.cu::russianRouletteTerminate`, called from `shadeFakeMaterial` immediately **after** `scatterRay`. This placement ensures that paths which already terminated cleanly (light hit / miss / alpha discard) are not re-rolled.
+- The flag `enableRussianRoulette` is wired through `GuiDataContainer::enableRussianRoulette` (default `false`) and surfaced as the ImGui checkbox **"Enable Russian Roulette"**.
+- When disabled, `russianRouletteTerminate` short-circuits and the path is never stochastically killed — behaviour matches the original fixed-depth termination exactly.
+
+### Expected Impact
+
+- **Performance**: For closed scenes (e.g. Cornell Box) most paths terminate on diffuse bounces after 2-3 hits, so their throughput has already dropped substantially. RR prunes them earlier and reduces active-path count, which speeds up the tail end of each iteration (where stream compaction is most beneficial).
+- **Quality**: Asymptotically unbiased. Per-iteration noise may increase slightly because fewer samples survive the tail, but the long-run average converges to the same image.
+- **Comparison vs. CPU**: A CPU implementation would have to track termination probabilities per pixel path on the host. On the GPU each thread carries its own `PathSegment` state, so RR is essentially free (one clamp, one divide, one RNG draw per scatter) — the GPU version benefits massively from this per-path locality.
+
+---
+
+*Last updated: 2026-06-20*

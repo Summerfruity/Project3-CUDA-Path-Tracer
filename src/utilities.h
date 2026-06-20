@@ -29,6 +29,7 @@ public:
     bool enableAntialiasing = true;
     bool enableMeshAabbCulling = true;
     bool enableMeshBvh = true;
+    bool enableRussianRoulette = false;
 };
 
 namespace utilityCore
