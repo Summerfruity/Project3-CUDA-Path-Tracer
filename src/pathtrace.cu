@@ -109,6 +109,7 @@ static int* dev_materialSortKeys = NULL;
 static Triangle* dev_triangles = NULL;
 static MeshRange* dev_meshRanges = NULL; // the range of triangles and AABB of each mash/primitive
 static BVHNode* dev_bvhNodes = NULL; 
+static BVHNode* dev_tlasNodes = NULL;
 static glm::vec3* dev_texturePixels = NULL;
 static int* dev_textureOffsets = NULL;
 static int* dev_textureWidths = NULL;
@@ -176,6 +177,17 @@ void pathtraceInit(Scene* scene)
     else
     {
         dev_bvhNodes = nullptr;
+    }
+
+    if(!scene->tlasNodes.empty())
+    {
+        cudaMalloc(&dev_tlasNodes, scene->tlasNodes.size() * sizeof(BVHNode));
+        cudaMemcpy(dev_tlasNodes, scene->tlasNodes.data(),
+                    scene->tlasNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
+    }
+    else
+    {
+        dev_tlasNodes = nullptr;
     }
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
@@ -250,6 +262,7 @@ void pathtraceFree()
     cudaFree(dev_terminatedCount);
     cudaFree(dev_materialSortKeys);
     cudaFree(dev_bvhNodes);
+    cudaFree(dev_tlasNodes);
     StreamCompaction::Efficient::freeScanDeviceBuffer();
     pathtraceCheckCUDA("pathtraceFree", __LINE__);
 }
@@ -384,6 +397,157 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
     }
 }
 
+__device__ bool intersectMeshRange(
+    const MeshRange& range,
+    const Triangle* triangles,
+    const BVHNode* bvhNodes,
+    Ray ray,
+    bool enableMeshBvh,
+    float& t_min,
+    glm::vec3& intersect_point,
+    glm::vec3& surfaceNormal,
+    glm::vec3& geometricNormal,
+    bool& closest_outside,
+    int& hit_triangle_material_id,
+    glm::vec2& uv)
+{
+    bool hit_from_triangle = false;
+
+    if (enableMeshBvh && range.bvhRootIndex >= 0 && bvhNodes != nullptr)
+    {
+        hit_from_triangle = bvhIntersectionTest(
+            bvhNodes, range.bvhRootIndex, range, triangles,
+            ray,
+            t_min,
+            intersect_point, surfaceNormal, geometricNormal,
+            closest_outside, hit_triangle_material_id, uv);
+    }
+    else
+    {
+        for(int j = 0; j < range.triCount; j++)
+        {
+            const Triangle& tri = triangles[range.triStartIndex + j];
+            glm::vec3 tmp_intersect;
+            glm::vec3 tmp_surfaceNormal;
+            glm::vec3 tmp_geometricNormal;
+            glm::vec2 tmp_uv;
+            bool tmp_outside;
+            float t = triangleIntersectionTest(tri, ray, tmp_intersect,
+                                               tmp_surfaceNormal, tmp_geometricNormal,
+                                               tmp_outside, tmp_uv);
+
+            if (t > 0 && t < t_min)
+            {
+                t_min = t;
+                intersect_point = tmp_intersect;
+                surfaceNormal = tmp_surfaceNormal;
+                geometricNormal = tmp_geometricNormal;
+                closest_outside = tmp_outside;
+                hit_triangle_material_id = tri.materialId;
+                hit_from_triangle = true;
+                uv = tmp_uv;
+            }
+        }
+    }
+
+    return hit_from_triangle;
+}
+
+__device__ bool intersectMeshRangesThroughTlas(
+    const BVHNode* tlasNodes,
+    int rootIndex,
+    const MeshRange* meshRanges,
+    const Triangle* triangles,
+    const BVHNode* bvhNodes,
+    Ray ray,
+    bool enableMeshBvh,
+    float& t_min,
+    glm::vec3& intersect_point,
+    glm::vec3& surfaceNormal,
+    glm::vec3& geometricNormal,
+    bool& closest_outside,
+    int& hit_triangle_material_id,
+    glm::vec2& uv)
+{
+    if (rootIndex < 0 || tlasNodes == nullptr)
+    {
+        return false;
+    }
+
+    const int STACK_SIZE = 128;
+    int stack[STACK_SIZE];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = rootIndex;
+
+    bool hit = false;
+    while (stack_ptr > 0)
+    {
+        int nodeIdx = stack[--stack_ptr];
+        const BVHNode& node = tlasNodes[nodeIdx];
+
+        float aabbT = aabbIntersectionTest(node.aabbMin, node.aabbMax, ray, t_min);
+        if (aabbT < 0.0f)
+        {
+            continue;
+        }
+
+        if (node.isLeaf)
+        {
+            for (int i = 0; i < node.right; ++i)
+            {
+                int meshRangeIndex = node.left + i;
+                const MeshRange& range = meshRanges[meshRangeIndex];
+                hit = intersectMeshRange(
+                    range, triangles, bvhNodes, ray, enableMeshBvh,
+                    t_min, intersect_point, surfaceNormal, geometricNormal,
+                    closest_outside, hit_triangle_material_id, uv) || hit;
+            }
+        }
+        else
+        {
+            const BVHNode& leftChild = tlasNodes[node.left];
+            const BVHNode& rightChild = tlasNodes[node.right];
+            float tLeft = aabbIntersectionTest(leftChild.aabbMin, leftChild.aabbMax, ray, t_min);
+            float tRight = aabbIntersectionTest(rightChild.aabbMin, rightChild.aabbMax, ray, t_min);
+
+            bool hitLeft = (tLeft >= 0.0f);
+            bool hitRight = (tRight >= 0.0f);
+            if (hitLeft && hitRight)
+            {
+                if (stack_ptr + 2 <= STACK_SIZE)
+                {
+                    if (tLeft < tRight)
+                    {
+                        stack[stack_ptr++] = node.right;
+                        stack[stack_ptr++] = node.left;
+                    }
+                    else
+                    {
+                        stack[stack_ptr++] = node.left;
+                        stack[stack_ptr++] = node.right;
+                    }
+                }
+            }
+            else if (hitLeft)
+            {
+                if (stack_ptr + 1 <= STACK_SIZE)
+                {
+                    stack[stack_ptr++] = node.left;
+                }
+            }
+            else if (hitRight)
+            {
+                if (stack_ptr + 1 <= STACK_SIZE)
+                {
+                    stack[stack_ptr++] = node.right;
+                }
+            }
+        }
+    }
+
+    return hit;
+}
+
 // TODO:
 // computeIntersections handles generating ray intersections ONLY.
 // Generating new rays is handled in your shader(s).
@@ -398,6 +562,8 @@ __global__ void computeIntersections(
     MeshRange* meshRanges,
     int meshRanges_size,
     BVHNode* bvhNodes, 
+    BVHNode* tlasNodes,
+    int tlasRootIndex,
     bool enableMeshAabbCulling,
     bool enableMeshBvh, 
     ShadeableIntersection* intersections)
@@ -462,6 +628,22 @@ __global__ void computeIntersections(
             }
         }
 
+        if (enableMeshBvh && tlasNodes != nullptr && tlasRootIndex >= 0)
+        {
+            bool hitTri = intersectMeshRangesThroughTlas(
+                tlasNodes, tlasRootIndex, meshRanges, triangles, bvhNodes,
+                pathSegment.ray, enableMeshBvh,
+                t_min, intersect_point, surfaceNormal, geometricNormal,
+                closest_outside, hit_triangle_material_id, uv);
+
+            if (hitTri)
+            {
+                hit_from_triangle = true;
+                hit_geom_index = -1;
+            }
+        }
+        else
+        {
         // naive parse through meshs
         for(int i = 0; i < meshRanges_size; i++)
         {
@@ -516,6 +698,7 @@ __global__ void computeIntersections(
                     }
                 }
             }
+        }
         }
 
         if (hit_geom_index == -1 && !hit_from_triangle)
@@ -689,6 +872,8 @@ __global__ void shadeFakeMaterial(
                     glm::vec3 texel = texturePixels[textureOffsets[tid] + y * w + x];
                     materialColor *= texel;
                     material.color = materialColor;
+                    material.specular.color = glm::mix(glm::vec3(0.04f), materialColor,
+                                                       glm::clamp(material.hasReflective, 0.0f, 1.0f));
                 }
             }
 
@@ -884,6 +1069,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_meshRanges,
             hst_scene->meshRanges.size(),
             dev_bvhNodes,
+            dev_tlasNodes,
+            hst_scene->tlasNodes.empty() ? -1 : 0,
             ENABLE_MESH_AABB_CULLING,
             ENABLE_MESH_BVH,
             dev_intersections

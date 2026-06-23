@@ -1,56 +1,62 @@
-# Project 3 CUDA Path Tracer — Implementation Status
+# Project 3 CUDA Path Tracer - Implementation Status
 
-> **Course**: CIS 5650 — GPU Programming & Architecture  
+> **Course**: CIS 5650 - GPU Programming & Architecture  
 > **Project**: CUDA Path Tracer  
-> **Scene Formats**: JSON ( Cornell Box / primitives ) + glTF 2.0 ( arbitrary mesh )  
-> **Build System**: CMake (CUDA 17 + C++17), CUDA–OpenGL interop for live preview
+> **Scene Formats**: JSON primitives + glTF 2.0 triangle meshes  
+> **Build System**: CMake, CUDA/C++17, CUDA-OpenGL interop preview
 
 ---
 
 ## 1. Executive Summary
 
-This project implements a fully functional GPU path tracer using CUDA. The renderer supports classic primitives (spheres & cubes) as well as arbitrary glTF 2.0 triangle meshes with hierarchical transforms, PBR materials, and texture mapping. Beyond the core Part 1 requirements, the implementation includes **refraction**, **depth of field**, **adaptive stream compaction**, **material type sorting**, **per-mesh AABB culling**, **per-mesh BVH acceleration**, and **glTF alpha/double-sided material extensions**. The total feature score exceeds the Part 2 minimum of **10 points**.
+The current renderer supports classic analytic primitives (spheres and cubes) plus arbitrary glTF 2.0 triangle meshes. It implements GPU path tracing with diffuse/specular/refractive BSDFs, stochastic antialiasing, stream compaction, material sorting, depth of field, Russian roulette, texture mapping, and mesh acceleration.
+
+Mesh acceleration now has two levels:
+
+- A top-level BVH over `MeshRange` AABBs.
+- Per-mesh triangle BVHs for large `MeshRange`s.
+
+glTF loading supports geometry, transforms, UVs, base-color textures, emissive textures, and a practical subset of material fields. **glTF transmission/glass is not currently implemented**: `KHR_materials_transmission` is not mapped to the internal refractive material path.
 
 ---
 
 ## 2. Feature Matrix
 
-### Part 1 — Core Features (Required)
+### Part 1 - Core Features
 
 | Feature | Status | File / Kernel | Notes |
 |---------|--------|---------------|-------|
-| Diffuse BSDF | ✅ | `interactions.cu::scatterRay` | Cosine-weighted hemisphere sampling |
-| Stream Compaction | ✅ | `pathtrace.cu` + `stream_compaction/efficient.cu` | Work-efficient prefix-sum scan; adaptive threshold toggle |
-| Material Type Sort | ✅ | `pathtrace.cu::buildMaterialSortKeys` | Buckets: Emissive, Specular, Refractive, Diffuse, Miss, Dead |
-| Stochastic Antialiasing | ✅ | `pathtrace.cu::generateRayFromCamera` | Per-pixel uniform jitter; fallback to center sampling when disabled |
+| Diffuse BSDF | Done | `interactions.cu::scatterRay` | Cosine-weighted hemisphere sampling |
+| Stream Compaction | Done | `pathtrace.cu` + `stream_compaction/efficient.cu` | Work-efficient scan plus adaptive gating |
+| Material Type Sort | Done | `pathtrace.cu::buildMaterialSortKeys` | Buckets rays by material behavior |
+| Stochastic Antialiasing | Done | `pathtrace.cu::generateRayFromCamera` | Per-pixel jitter |
 
-### Part 2 — Extra Features
+### Part 2 - Extra Features
 
 | Feature | Points | Status | File / Kernel | Notes |
 |---------|--------|--------|---------------|-------|
-| **glTF 2.0 Mesh Loading** | :four: | ✅ | `scene.cpp::loadGLTFObject` | Node hierarchy, TRS/matrix transforms, multi-primitive, multi-material |
-| **AABB Intersection Culling** | — | ✅ | `intersections.cu::aabbIntersectionTest` | Per-`MeshRange` slab method; togglable via ImGui |
-| **Refraction (Glass/Water)** | :two: | ✅ | `interactions.cu::scatterRay` | Snell's law + Schlick Fresnel + TIR handling |
-| **Depth of Field** | :two: | ✅ | `pathtrace.cu::generateRayFromCamera` | Thin-lens model, polar disk sampling |
-| **Specular / Glossy Reflection** | — | ✅ | `interactions.cu::scatterRay` | Perfect mirror + roughness hemisphere perturbation |
-| **Russian Roulette** | :one: | ✅ | `pathtrace.cu::russianRouletteTerminate` | Veach-style RR (PBRTv3 13.7): survival probability = clamp(max(throughput), 0.05, 0.95); throughput re-weighted by 1/q to keep the estimator unbiased |
-| **BVH Acceleration (per-mesh)** | :six: | ✅ | `bvh.cpp` + `intersections.cu::bvhIntersectionTest` | Midpoint-split BVH built on CPU; iterative GPU traversal with near-first stack |
-| **Base Color Texture** | — | ✅ | `pathtrace.cu::shadeFakeMaterial` | `stbi_load` → packed GPU texture atlas |
-| **Emissive Texture** | — | ✅ | `pathtrace.cu::shadeFakeMaterial` | Overrides material color for light emitters |
-| **glTF Material Features** | — | ✅ | `scene.cpp::convertGltfMaterial` | `alphaMode` (OPAQUE/MASK/BLEND), `doubleSided`, `alphaCutoff` |
+| glTF 2.0 Mesh Loading | 4 | Done | `scene.cpp::loadGLTFObject` | Node hierarchy, TRS/matrix transforms, multi-primitive, multi-material |
+| AABB Intersection Culling | Included | Done | `intersections.cu::aabbIntersectionTest` | Mesh-range slab tests |
+| BVH Acceleration | 6 | Done | `bvh.cpp`, `pathtrace.cu`, `intersections.cu` | Top-level `MeshRange` BVH plus per-mesh triangle BVHs |
+| Refraction | 2 | Done | `interactions.cu::scatterRay` | JSON `Refractive` materials only |
+| Depth of Field | 2 | Done | `pathtrace.cu::generateRayFromCamera` | Thin-lens model |
+| Russian Roulette | 1 | Done | `pathtrace.cu::russianRouletteTerminate` | Unbiased throughput re-weighting |
+| Base Color Texture | Included | Done | `scene.cpp`, `pathtrace.cu::shadeFakeMaterial` | glTF base-color texture loaded with `stbi_load` and sampled from UVs |
+| Emissive Texture | Included | Done | `scene.cpp`, `pathtrace.cu::shadeFakeMaterial` | glTF emissive texture support |
+| glTF Material Subset | Included | Done | `scene.cpp::convertGltfMaterial` | Base color, metallic/roughness approximation, `alphaMode`, `doubleSided`, `alphaCutoff` |
 
-### Not Implemented (Future Work)
+### Not Implemented / Future Work
 
-| Feature | Points | Why Not |
-|---------|--------|---------|
-| Bump / Normal Mapping | :five:/:six: | Infrastructure ready (normals + UVs exist), but TBN matrix not computed |
-| Russian Roulette | :one: | ✅ Implemented (Veach-style); throughput re-weighted by 1/q to remain unbiased |
-| Direct Lighting (NEE) | :two: | Standard path tracing only; no explicit light sampling per bounce |
-| Wavefront Path Tracing | :six: | Single mega-kernel (`shadeFakeMaterial`) instead of material-specific kernels |
-| OIDN Denoiser | :three: | No CPU denoiser integration |
-| Procedural Shapes / Textures | :four: | All geometry loaded from files |
-| Motion Blur | :three: | No time-dimension sampling |
-| Post-processing Shaders | :three: | Linear color output directly to PBO; no tone mapping / gamma correction |
+| Feature | Notes |
+|---------|-------|
+| glTF transmission / glass | `KHR_materials_transmission` is not converted to `hasRefractive`; glTF glass may appear tinted but is not physically refractive |
+| glTF normal mapping | Normals are loaded, but normal textures and TBN are not implemented |
+| glTF metallic/roughness texture | Scalar metallic/roughness factors are approximated; packed ORM textures are ignored |
+| glTF clearcoat / sheen | Extension fields are ignored |
+| Direct lighting / NEE | Standard path tracing only |
+| Tone mapping / gamma correction | Linear radiance is written directly to the preview/output buffer |
+| Denoising | No CPU/GPU denoiser integration |
+| Motion blur | No time sampling |
 
 ---
 
@@ -58,155 +64,115 @@ This project implements a fully functional GPU path tracer using CUDA. The rende
 
 ### 3.1 glTF Pipeline (`scene.cpp`)
 
-The scene loader supports both JSON (for simple primitives) and glTF 2.0 (for arbitrary meshes). When a JSON object has `"TYPE": "gltf"`, the path is resolved relative to the scene file and passed to `loadGLTFObject`.
+The scene loader handles JSON scenes and recognizes `"TYPE": "gltf"` objects. The glTF path is resolved relative to the scene JSON and then passed to `Scene::loadGLTFObject`.
 
 #### 3.1.1 Parsing & Node Hierarchy
-- **Parser**: `tinygltf v3` (`tg3_*` API) is used to load the binary/JSON glTF file.
-- **Node traversal**: a recursive lambda `traverseNode(nodeIndex, parentTransform)` walks the scene graph:
-  ```cpp
-  glm::mat4 nodeTransform = parentTransform * nodeLocalTransform(node);
-  glm::mat4 finalTransform = objectTransform * nodeTransform;
-  ```
-  `objectTransform` is the scene-level transform from the JSON file (translation, rotation, scale); `nodeTransform` is the internal glTF node hierarchy transform.
-- **Local transform**: `nodeLocalTransform` supports both:
-  - Explicit `4×4` matrix (`node.has_matrix`), read in **column-major** order to match glm.
-  - TRS decomposition: `translate * rotate * scale`.
 
-#### 3.1.2 Triangle Extraction (`processPrimitive`)
-For each primitive in a mesh:
-1. **Attribute accessors** are located by name (`POSITION`, `NORMAL`, `TEXCOORD_0`).
-2. **Index buffer** is read if present (`prim.indices >= 0`); otherwise vertices are assumed to be a flat triangle list.
-3. **Vertex transform**: positions are transformed by `finalTransform` (object × node hierarchy). Normals use the **inverse-transpose** of the linear part (`glm::mat3(transpose(inverse(transform)))`) to handle non-uniform scale correctly.
-4. **Normal fallback**: if no vertex normals exist, face normals are computed via `cross(v1-v0, v2-v0)`.
-5. **Degenerate triangles** (zero-area) are skipped to avoid NaN propagation.
-6. **Material remapping**: glTF material indices are mapped to the internal `materials` vector; if a primitive has no material, it falls back to the material specified in the JSON scene file.
+- Parser: tinygltf v3 (`tg3_*` API).
+- Node traversal: recursive traversal of the glTF scene graph.
+- Node transforms: supports explicit matrix and TRS composition.
+- Final transform: JSON object transform is multiplied with the internal glTF node hierarchy transform.
 
-#### 3.1.3 AABB Construction
-During `pushTriangle`, per-primitive axis-aligned bounding boxes are accumulated:
-```cpp
-aabbMin = min(aabbMin, p0/p1/p2);
-aabbMax = max(aabbMax, p0/p1/p2);
-```
-After all triangles of a primitive are processed, a `MeshRange` is pushed:
+#### 3.1.2 Triangle Extraction
+
+For each triangle primitive:
+
+1. Locate `POSITION`, optional `NORMAL`, and optional `TEXCOORD_0`.
+2. Read indexed or non-indexed triangle data.
+3. Transform positions into world space.
+4. Transform normals by the inverse-transpose of the linear transform.
+5. Compute face-normal fallback when vertex normals are absent.
+6. Skip degenerate triangles.
+7. Store vertices, normals, UVs, and material ID in the global `Triangle` array.
+
+#### 3.1.3 MeshRange and AABB Construction
+
+Each glTF primitive becomes a `MeshRange`:
+
 ```cpp
 struct MeshRange {
-    int triStartIndex;   // offset into global Triangle[]
-    int triCount;        // number of triangles
+    int triStartIndex;
+    int triCount;
     glm::vec3 aabbMin;
     glm::vec3 aabbMax;
+    int bvhRootIndex;
+    int bvhNodeCount;
 };
 ```
-This allows the GPU to cull entire primitives before testing individual triangles.
+
+The AABB is accumulated from transformed triangle vertices. These ranges are used both for direct AABB culling and for top-level BVH construction.
 
 ---
 
-### 3.2 GPU Ray Intersection (`intersections.cu`)
+## 3.2 GPU Ray Intersection
 
-#### 3.2.1 Primitives
-- **Box**: Ray is transformed into object space (`inverseTransform`), then a slab test is performed on the unit cube `[-0.5, 0.5]³`. The face normal is transformed back to world space via `invTranspose`.
-- **Sphere**: Ray is transformed into object space, then a standard quadratic discriminant test. The hit point and normal are transformed back to world space.
+`computeIntersections` operates in two phases:
 
-#### 3.2.2 Triangle — Möller-Trumbore
-`triangleIntersectionTest` implements the Möller-Trumbore algorithm in **world space** (vertices are pre-transformed on the CPU):
-```
-det = dot(edge1, cross(dir, edge2))
-u = dot(tvec, cross(dir, edge2)) / det
-v = dot(dir, cross(tvec, edge1)) / det
-t = dot(edge2, cross(tvec, edge1)) / det
-```
-- Barycentric coordinates `(u, v, w=1-u-v)` are used to interpolate vertex normals (`n0, n1, n2`) and UVs (`uv0, uv1, uv2`).
-- `outside` is determined by `dot(rayDir, geometricNormal) < 0`.
-- Returns Euclidean distance (consistent with box/sphere tests).
+1. Analytic primitive pass over JSON `Geom`s.
+2. Mesh pass over glTF triangles.
 
-#### 3.2.3 AABB Culling — Slab Method
-`aabbIntersectionTest` tests a ray against a `MeshRange` AABB:
-1. For each axis, compute `t0 = (min - origin) / dir`, `t1 = (max - origin) / dir`, swap if necessary.
-2. Track the **enter** (`max(t0)`) and **exit** (`min(t1)`) distances across all axes.
-3. Early-out if `tEnter > tExit` or `tExit <= 0`.
-4. Return `-1` if the nearest hit `tNear > maxT` (the current closest intersection from geoms or previous meshes), allowing early culling of entire meshes.
+When **Enable Mesh BVH** is on and TLAS nodes exist, mesh traversal uses:
 
-#### 3.2.4 Integration in `computeIntersections`
-The kernel operates in two phases per ray:
-1. **Primitive pass**: iterate all `Geom` (boxes/spheres), track `t_min`.
-2. **Mesh pass**: iterate all `MeshRange`; if AABB culling is enabled, skip meshes whose AABB is farther than `t_min`. Otherwise, test every triangle in the range and update `t_min` if closer.
+1. Top-level BVH over `MeshRange` AABBs.
+2. Per-mesh triangle BVH for each selected range.
 
-A critical state-tracking bug was fixed in a recent revision: when a geom is hit closer than a prior triangle, `hit_from_triangle` is reset to `false` so the final material selection uses the geom's material.
+When Mesh BVH is off, the renderer falls back to the older path that scans every `MeshRange`, optionally using per-range AABB culling before brute-force triangle tests.
 
-#### 3.2.5 Per-Mesh BVH (`bvh.cpp` + `intersections.cu::bvhIntersectionTest`)
-For each `MeshRange` with at least `BVH_MIN_TRIANGLES` triangles (default 16), a binary BVH is built on the CPU after glTF loading:
-1. **Build primitive**: each triangle is wrapped with its centroid and AABB.
-2. **Split axis**: choose the axis with the largest centroid extent.
-3. **Midpoint split**: use `std::nth_element` to partition triangles by centroid along the chosen axis.
-4. **Leaf**: when `count <= maxLeafSize` (4), `depth >= maxDepth` (32), or the extent is negligible.
-5. **Reorder**: the global `Triangle` array is reordered in-place so that a leaf's `left` offset directly indexes the contiguous triangle block.
+### Triangle Intersection
 
-On the GPU, `bvhIntersectionTest` traverses the tree iteratively with a fixed-size stack:
-- Test the current node's AABB against the ray (using the current best `t` to prune).
-- If a leaf is reached, test all triangles in the leaf and update the closest hit.
-- If an internal node is reached, test both children and push the farther one first so the nearer one is popped first (near-first traversal).
+`triangleIntersectionTest` uses Moller-Trumbore in world space. Barycentric coordinates interpolate smooth normals and UVs. The `ShadeableIntersection` stores both:
 
-The BVH path is toggled at runtime via the ImGui **Enable Mesh BVH** checkbox and falls back to brute-force triangle iteration when disabled or when the `MeshRange` is too small to build a BVH.
+- `surfaceNormal`: face-forward shading normal.
+- `geometricNormal`: outward geometric normal.
+
+This split keeps diffuse/specular shading and refractive enter/exit logic separate.
 
 ---
 
-### 3.3 BSDF & Shading (`interactions.cu` + `pathtrace.cu`)
+## 3.3 BVH Acceleration
 
-#### 3.3.1 Diffuse — Cosine-Weighted Hemisphere
-`calculateRandomDirectionInHemisphere` generates a cosine-weighted direction:
-- `cosθ = sqrt(ξ₁)`, `sinθ = sqrt(1 - cos²θ)`, `φ = 2π ξ₂`
-- A temporary basis `(perpendicular1, perpendicular2, normal)` is constructed to avoid numerical instability when the normal is close to `(1,1,1)/√3`.
+### Per-Mesh BVH
 
-#### 3.3.2 Specular / Glossy
-- **Perfect mirror**: `reflect(incident, normal)`.
-- **Glossy blur**: if `roughness > SPECULAR_ROUGHNESS_EPS`, a random direction in the hemisphere around the mirror direction is sampled, then mixed with the perfect reflection via `mix(mirrorDir, glossyDir, roughness²)`.
-- **Probability weighting**: the path uses Russian-roulette-style branching — `pSpec = hasReflective`, `pDiff = 1 - pSpec`. The throughput is divided by the branch probability to keep the estimator unbiased.
+For each `MeshRange` with at least 16 triangles:
 
-#### 3.3.3 Refraction
-When `hasRefractive > 0`:
-1. Determine incident side: `entering = outside`.
-2. Compute `eta = n₁/n₂` (air → material or material → air).
-3. Refract via `glm::refract(inDir, normal, eta)`.
-4. Compute **Schlick Fresnel** reflectance:
-   ```
-   r0 = ((1 - ior) / (1 + ior))²
-   reflectProb = r0 + (1 - r0)(1 - cosθ)⁵
-   ```
-5. If **total internal reflection** occurs (`|refracted|² ≈ 0`) or a random sample is below `reflectProb`, choose reflection; otherwise refraction.
-6. Throughput is multiplied by `color` on refraction, or `1.0` on reflection (Fresnel weighting is implicitly handled by the probability split).
-7. Origin is offset along the surface normal to avoid self-intersection.
+1. Build triangle primitives with centroids and AABBs.
+2. Split on the largest centroid extent.
+3. Partition with `std::nth_element`.
+4. Stop at max leaf size 4 or max depth 32.
+5. Reorder the global triangle array so leaves point to contiguous triangle blocks.
 
-#### 3.3.4 `shadeFakeMaterial` Kernel
-Despite the name, this kernel performs full BSDF shading. Key logic:
-- **Emissive**: if `emittance > 0`, accumulate `throughput * materialColor * emittance` and terminate the path.
-- **Base Color Texture**: if present, sample the packed texture atlas and multiply `materialColor`.
-- **Emissive Texture**: if present, overrides `materialColor` for light sources.
-- **Double-sided**: if `doubleSided == 0` and ray hits back-face, terminate (or treat as miss).
-- **Alpha Mask**: if `alphaMode == MASK` and `baseAlpha < alphaCutoff`, the ray passes through the surface without consuming a bounce (origin advanced by `t + EPSILON`).
-- **Alpha Blend**: if `alphaMode == BLEND`, a stochastic test decides whether the ray passes through or is shaded.
+### Top-Level BVH
+
+`buildBVHForMeshRanges` builds a second BVH over all `MeshRange` AABBs. It also reorders `meshRanges` to match TLAS leaf order. The GPU traversal in `pathtrace.cu` first prunes whole mesh ranges before entering per-mesh BVHs.
+
+This removes the previous limitation where every ray had to linearly test every mesh-range AABB before finding relevant triangle BVHs.
 
 ---
 
-### 3.4 Performance Optimizations
+## 3.4 BSDF & Shading
 
-#### 3.4.1 Stream Compaction
-After each bounce, terminated paths (`remainingBounces <= 0`) are gathered into the accumulation image, then active paths are compacted:
-1. `mapActivePaths`: write `1` if `remainingBounces > 0`, else `0`.
-2. `StreamCompaction::Efficient::scanDevice`: exclusive prefix sum over the flags.
-3. `scatterActivePaths`: copy surviving paths to `dev_paths_compact`.
-4. Pointer swap: `dev_paths ↔ dev_paths_compact`.
+### Diffuse
 
-**Adaptive compaction**: if enabled, compaction only runs when `activeRatio <= threshold` and `num_paths >= min_paths`. This avoids paying the scan cost early in the path when most rays are still alive.
+Diffuse surfaces sample a cosine-weighted hemisphere around the shading normal.
 
-#### 3.4.2 Material Type Sort
-Before shading, paths are sorted by material bucket (via `thrust::sort_by_key` on a zip iterator of `(dev_paths, dev_intersections)`). This groups threads executing similar code, reducing warp divergence.
+### Specular / Glossy
 
-#### 3.4.3 Depth of Field
-In `generateRayFromCamera`:
-1. Compute the pinhole ray direction through the pixel center + jitter.
-2. If `apertureRadius > 0`:
-   - Sample a point on the lens disk: `r = aperture * sqrt(ξ₁)`, `θ = 2π ξ₂`.
-   - Compute focal plane intersection: `focalT = focalDistance / dot(pinholeDir, view)`.
-   - New ray origin = lens sample; new direction = `normalize(focalPoint - lensOrigin)`.
+Specular surfaces use perfect reflection, with optional roughness blur by mixing the mirror direction with a sampled hemisphere direction.
+
+### Refraction
+
+JSON `Refractive` materials use:
+
+- Snell refraction via `glm::refract`.
+- Schlick Fresnel probability.
+- Total internal reflection handling.
+- A single offset in `scatterRay` to avoid self-intersection.
+
+glTF `KHR_materials_transmission` is currently **not** connected to this path.
+
+### Texture Sampling
+
+Base-color and emissive textures are loaded with `stbi_load`, packed into GPU buffers, and sampled in `shadeFakeMaterial` from interpolated UVs. The current sampler is nearest-neighbor with wrapping.
 
 ---
 
@@ -214,29 +180,31 @@ In `generateRayFromCamera`:
 
 | Issue | Severity | Details |
 |-------|----------|---------|
-| No global BVH | Medium | Each MeshRange has its own BVH, but there is no top-level BVH across MeshRanges. Scenes with many small primitives still pay per-mesh overhead. |
-| Energy conservation (glossy) | Low | Roughness blur uses hemisphere sampling without dividing by the sample PDF. Slightly biased brightness. |
-| No gamma correction | Low | `sendImageToPBO` writes linear radiance directly; output may look dark on standard displays without post-process tone mapping. |
-| Alpha from texture | Low | `stbi_load` requests 3 channels, so texture alpha is unavailable for `alphaMode == MASK`. |
-| No Russian Roulette | Low | Fixed-depth termination only; some paths could terminate earlier without bias. *(Resolved: Russian Roulette now implemented; toggleable via ImGui.)* |
-| No Direct Lighting | Medium | Standard uni-directional path tracing; scenes with small bright lights converge slowly. |
+| glTF transmission/glass unsupported | Medium | `KHR_materials_transmission` is ignored; glTF glass is not physically refractive |
+| No glTF normal maps | Medium | Normal attributes are used, but normal textures and TBN are not implemented |
+| No glTF roughness/metallic textures | Medium | Scalar material factors are approximated; packed ORM texture maps are ignored |
+| Alpha from texture unavailable | Low | `stbi_load` requests RGB, so texture alpha is unavailable for alpha masking |
+| No direct lighting | Medium | Small lights converge slowly without next-event estimation |
+| No tone mapping / gamma correction | Low | Linear radiance is written directly to the output |
+| BVH build quality | Low | Midpoint split is simple; SAH/binned SAH could improve traversal |
 
 ---
 
 ## 5. How to Run
 
-```bash
-# JSON scene (Cornell Box)
-.\build\bin\release\cis565_path_tracer.exe .\scenes\cornell.json    
+```powershell
+# JSON scene
+.\build\bin\Release\cis565_path_tracer.exe .\scenes\cornell.json
 
 # glTF scene
-.\build\bin\release\cis565_path_tracer.exe .\scenes\render_gltf.json
+.\build\bin\Release\cis565_path_tracer.exe .\scenes\render_gltf.json
 ```
 
-**ImGui Toggles** (available at runtime):
+Runtime toggles:
+
 - Enable Antialiasing
 - Enable Stream Compaction
-- Enable Adaptive Compaction (with ratio threshold & min paths sliders)
+- Enable Adaptive Compaction
 - Enable Material Type Sort
 - Enable Mesh AABB Culling
 - Enable Mesh BVH
@@ -244,38 +212,4 @@ In `generateRayFromCamera`:
 
 ---
 
-## 6. Russian Roulette
-
-Russian Roulette (RR) terminates low-contribution paths stochastically to reduce wasted GPU work, while keeping the Monte Carlo estimator unbiased (Veach-style, PBRTv3 §13.7).
-
-### Algorithm
-
-After each `scatterRay` in `shadeFakeMaterial`, the path is offered to the roulette:
-
-1. Compute `q = clamp(max(throughput.r, throughput.g, throughput.b), 0.05, 0.95)`.
-   - **Floor 0.05** prevents divide-by-zero on near-zero throughput.
-   - **Ceiling 0.95** avoids aggressively killing moderate paths.
-2. **Re-weight throughput** to keep the estimator unbiased: `throughput /= q`.
-3. Sample `ξ ~ U(0,1)`. If `ξ < 1 - q`, terminate the path (`remainingBounces = 0`).
-
-The expected throughput contribution after RR is:
-
-  `E[L] = q · (original_throughput / q) + (1 - q) · 0 = original_throughput`
-
-so the estimator remains unbiased.
-
-### Implementation Details
-
-- Lives in `src/pathtrace.cu::russianRouletteTerminate`, called from `shadeFakeMaterial` immediately **after** `scatterRay`. This placement ensures that paths which already terminated cleanly (light hit / miss / alpha discard) are not re-rolled.
-- The flag `enableRussianRoulette` is wired through `GuiDataContainer::enableRussianRoulette` (default `false`) and surfaced as the ImGui checkbox **"Enable Russian Roulette"**.
-- When disabled, `russianRouletteTerminate` short-circuits and the path is never stochastically killed — behaviour matches the original fixed-depth termination exactly.
-
-### Expected Impact
-
-- **Performance**: For closed scenes (e.g. Cornell Box) most paths terminate on diffuse bounces after 2-3 hits, so their throughput has already dropped substantially. RR prunes them earlier and reduces active-path count, which speeds up the tail end of each iteration (where stream compaction is most beneficial).
-- **Quality**: Asymptotically unbiased. Per-iteration noise may increase slightly because fewer samples survive the tail, but the long-run average converges to the same image.
-- **Comparison vs. CPU**: A CPU implementation would have to track termination probabilities per pixel path on the host. On the GPU each thread carries its own `PathSegment` state, so RR is essentially free (one clamp, one divide, one RNG draw per scatter) — the GPU version benefits massively from this per-path locality.
-
----
-
-*Last updated: 2026-06-20*
+*Last updated: 2026-06-23*

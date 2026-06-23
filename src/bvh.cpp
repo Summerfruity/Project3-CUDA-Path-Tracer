@@ -150,3 +150,41 @@ std::vector<BVHNode> buildBVHForRange(std::vector<Triangle>& triangles,
     return nodes;
 
 }                                      
+
+std::vector<BVHNode> buildBVHForMeshRanges(std::vector<MeshRange>& meshRanges,
+                                           int maxLeafSize,
+                                           int maxDepth)
+{
+    std::vector<BVHBuildPrimitive> prims;
+    prims.reserve(meshRanges.size());
+
+    for (int i = 0; i < static_cast<int>(meshRanges.size()); ++i)
+    {
+        const MeshRange& range = meshRanges[i];
+        BVHBuildPrimitive p;
+        p.originalIndex = i;
+        p.aabbMin = range.aabbMin;
+        p.aabbMax = range.aabbMax;
+        p.centroid = (range.aabbMin + range.aabbMax) * 0.5f;
+        prims.push_back(p);
+    }
+
+    std::vector<BVHNode> nodes;
+    if (prims.empty())
+    {
+        return nodes;
+    }
+
+    nodes.reserve(2 * prims.size());
+    recursiveBuild(nodes, prims, 0, static_cast<int>(prims.size()), maxLeafSize, maxDepth, 0);
+
+    std::vector<MeshRange> reordered;
+    reordered.reserve(meshRanges.size());
+    for (int i = 0; i < static_cast<int>(prims.size()); ++i)
+    {
+        reordered.push_back(meshRanges[prims[i].originalIndex]);
+    }
+    meshRanges = std::move(reordered);
+
+    return nodes;
+}

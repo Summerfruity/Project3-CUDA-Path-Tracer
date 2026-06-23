@@ -10,3 +10,8 @@ std::vector<BVHNode> buildBVHForRange(
     int maxLeafSize = 4,
     int maxDepth = 32,
     int nodeBaseOffset = 0); // offset to add to node indices (used for recursive calls)
+
+std::vector<BVHNode> buildBVHForMeshRanges(
+    std::vector<MeshRange>& meshRanges,
+    int maxLeafSize = 4,
+    int maxDepth = 32);

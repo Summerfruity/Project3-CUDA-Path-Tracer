@@ -622,11 +622,14 @@ void Scene::loadGLTFObject(const std::string& gltfPath, int materialId, const gl
         range.bvhNodeCount = static_cast<int>(localNodes.size());
         bvhNodes.insert(bvhNodes.end(), localNodes.begin(), localNodes.end());
     }
+
+    tlasNodes = buildBVHForMeshRanges(meshRanges, 4, 32);
     
 
     std::cout << "Loaded glTF: " << gltfPath
               << ", total triangles: " << triangles.size()
               << ", mesh ranges: " << meshRanges.size()
+              << ", TLAS nodes: " << tlasNodes.size()
               << std::endl;
 
     
