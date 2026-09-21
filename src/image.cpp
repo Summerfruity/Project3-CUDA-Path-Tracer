@@ -4,6 +4,20 @@
 
 #include <iostream>
 #include <string>
+#include <cmath>
+
+namespace
+{
+    // Convert linear radiance to the sRGB transfer curve for 8-bit display
+    // output. Values outside display range are clipped before conversion.
+    float linearToSrgb(float value)
+    {
+        value = std::fmax(0.0f, std::fmin(1.0f, value));
+        return value <= 0.0031308f
+            ? 12.92f * value
+            : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+    }
+}
 
 Image::Image(int x, int y)
     : xSize(x), ySize(y), pixels(new glm::vec3[x * y]) 
@@ -11,7 +25,7 @@ Image::Image(int x, int y)
 
 Image::~Image()
 {
-    delete pixels;
+    delete[] pixels;
 }
 
 void Image::setPixel(int x, int y, const glm::vec3 &pixel)
@@ -28,10 +42,13 @@ void Image::savePNG(const std::string &baseFilename)
         for (int x = 0; x < xSize; x++)
         {
             int i = y * xSize + x;
-            glm::vec3 pix = glm::clamp(pixels[i], glm::vec3(), glm::vec3(1)) * 255.f;
-            bytes[3 * i + 0] = (unsigned char) pix.x;
-            bytes[3 * i + 1] = (unsigned char) pix.y;
-            bytes[3 * i + 2] = (unsigned char) pix.z;
+            glm::vec3 pix(
+                linearToSrgb(pixels[i].x),
+                linearToSrgb(pixels[i].y),
+                linearToSrgb(pixels[i].z));
+            bytes[3 * i + 0] = (unsigned char) std::lround(pix.x * 255.0f);
+            bytes[3 * i + 1] = (unsigned char) std::lround(pix.y * 255.0f);
+            bytes[3 * i + 2] = (unsigned char) std::lround(pix.z * 255.0f);
         }
     }
 

@@ -20,6 +20,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <vector>
+#include <cctype>
+#include <cmath>
 #include <stb_image.h>
 
 using namespace std;
@@ -154,7 +157,51 @@ namespace
      * and other relevant properties from the tg3_material 
      * and populates a Material struct that can be used in our path tracer.
      */
-    static int loadGltfTexture(const tg3_model& model, int textureIndex, const std::filesystem::path& gltfFilePath, std::vector<TextureData>& textures)
+    static bool decodeBase64(const std::string& input, std::vector<unsigned char>& output)
+    {
+        static constexpr unsigned char table[256] = {
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+            52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+            64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+            64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64
+        };
+        output.clear();
+        int value = 0;
+        int bits = -8;
+        for (unsigned char c : input)
+        {
+            if (std::isspace(c) || c == '=') continue;
+            if (c >= 128 || table[c] == 64) return false;
+            value = (value << 6) | table[c];
+            bits += 6;
+            if (bits >= 0)
+            {
+                output.push_back((unsigned char)((value >> bits) & 0xff));
+                bits -= 8;
+            }
+        }
+        return !output.empty();
+    }
+
+    // glTF color textures (baseColor and emissive) are encoded as sRGB, while
+    // metallic-roughness textures carry linear data. Decode only the former
+    // before storing texels in the renderer's linear working space.
+    static float srgbToLinear(float value)
+    {
+        return value <= 0.04045f
+            ? value / 12.92f
+            : std::pow((value + 0.055f) / 1.055f, 2.4f);
+    }
+
+    static int loadGltfTexture(const tg3_model& model,
+                               int textureIndex,
+                               const std::filesystem::path& gltfFilePath,
+                               std::vector<TextureData>& textures,
+                               bool srgb)
     {
         if (textureIndex < 0 || textureIndex >= (int)model.textures_count)
         {
@@ -166,17 +213,42 @@ namespace
             return -1;
         }
         const tg3_image& img = model.images[tex.source];
-        if (!img.uri.data || img.uri.len == 0)
-        {
-            return -1;
-        }
-        std::filesystem::path imagePath = gltfFilePath.parent_path() / std::string(img.uri.data, img.uri.len);
         int w = 0, h = 0, ch = 0;
-        std::string imagePathStr = imagePath.string();
-        unsigned char* data = stbi_load(imagePathStr.c_str(), &w, &h, &ch, 3);
+        unsigned char* data = nullptr;
+        std::vector<unsigned char> encoded;
+        std::string uri = (img.uri.data && img.uri.len > 0)
+            ? std::string(img.uri.data, img.uri.len) : std::string();
+        if (uri.rfind("data:", 0) == 0)
+        {
+            const size_t comma = uri.find(',');
+            if (comma != std::string::npos &&
+                uri.substr(0, comma).find(";base64") != std::string::npos &&
+                decodeBase64(uri.substr(comma + 1), encoded))
+            {
+                data = stbi_load_from_memory(encoded.data(), (int)encoded.size(), &w, &h, &ch, 3);
+            }
+        }
+        else if (!uri.empty())
+        {
+            std::filesystem::path imagePath = gltfFilePath.parent_path() / uri;
+            data = stbi_load(imagePath.string().c_str(), &w, &h, &ch, 3);
+        }
+        else if (img.buffer_view >= 0 && img.buffer_view < (int)model.buffer_views_count)
+        {
+            const tg3_buffer_view& view = model.buffer_views[img.buffer_view];
+            if (view.buffer >= 0 && view.buffer < (int)model.buffers_count &&
+                view.byte_offset <= model.buffers[view.buffer].data.count &&
+                view.byte_length <= model.buffers[view.buffer].data.count - view.byte_offset)
+            {
+                const tg3_buffer& buffer = model.buffers[view.buffer];
+                data = stbi_load_from_memory(
+                    buffer.data.data + view.byte_offset,
+                    (int)view.byte_length, &w, &h, &ch, 3);
+            }
+        }
         if (!data)
         {
-            std::cerr << "Failed to load texture image: " << imagePath << std::endl;
+            std::cerr << "Failed to load texture image for glTF texture " << textureIndex << std::endl;
             return -1;
         }
         TextureData t{};
@@ -184,7 +256,15 @@ namespace
         t.pixels.resize((size_t)w * (size_t)h);
         for (int i = 0; i < w * h; ++i)
         {
-            t.pixels[i] = glm::vec3(data[3 * i + 0], data[3 * i + 1], data[3 * i + 2]) / 255.0f;
+            glm::vec3 texel(data[3 * i + 0], data[3 * i + 1], data[3 * i + 2]);
+            texel /= 255.0f;
+            if (srgb)
+            {
+                texel.x = srgbToLinear(texel.x);
+                texel.y = srgbToLinear(texel.y);
+                texel.z = srgbToLinear(texel.z);
+            }
+            t.pixels[i] = texel;
         }
         stbi_image_free(data);
         textures.push_back(std::move(t));
@@ -210,8 +290,10 @@ namespace
         roughness = glm::clamp(roughness, 0.0f, 1.0f);
 
         m.color = baseColor;
+        m.emissiveColor = emissive;
         m.baseColorTextureId = -1;
         m.emissiveTextureId = -1;
+        m.metallicRoughnessTextureId = -1;
         m.alphaMode = 0;
         m.alphaCutoff = static_cast<float>(gm.alpha_cutoff);
         m.doubleSided = gm.double_sided ? 1 : 0;
@@ -223,19 +305,37 @@ namespace
         m.isLight = 0;
 
         // glTF emissiveFactor alone does not mark a material as a terminator
-        // light; we keep the base color / metallic-roughness path intact and
-        // only use emittance as a multiplier for the (optional) emissive
-        // texture sample. True lights in this renderer come from JSON
-        // "Emitting" materials which set isLight = 1.
+        // light; keep it as an RGB emission color while preserving the base
+        // color / metallic-roughness path. True terminating lights in this
+        // renderer come from JSON "Emitting" materials.
         float emMax = glm::max(emissive.x, glm::max(emissive.y, emissive.z));
-        m.emittance = emMax;
+        m.emittance = emMax > 0.0f ? 1.0f : 0.0f;
         if (gm.pbr_metallic_roughness.base_color_texture.index >= 0)
         {
-            m.baseColorTextureId = loadGltfTexture(model, gm.pbr_metallic_roughness.base_color_texture.index, gltfFilePath, textures);
+            m.baseColorTextureId = loadGltfTexture(
+                model,
+                gm.pbr_metallic_roughness.base_color_texture.index,
+                gltfFilePath,
+                textures,
+                true);
         }
         if (gm.emissive_texture.index >= 0)
         {
-            m.emissiveTextureId = loadGltfTexture(model, gm.emissive_texture.index, gltfFilePath, textures);
+            m.emissiveTextureId = loadGltfTexture(
+                model,
+                gm.emissive_texture.index,
+                gltfFilePath,
+                textures,
+                true);
+        }
+        if (gm.pbr_metallic_roughness.metallic_roughness_texture.index >= 0)
+        {
+            m.metallicRoughnessTextureId = loadGltfTexture(
+                model,
+                gm.pbr_metallic_roughness.metallic_roughness_texture.index,
+                gltfFilePath,
+                textures,
+                false);
         }
 
         if (gm.alpha_mode.data)
@@ -652,6 +752,8 @@ void Scene::loadFromJSON(const std::string& jsonName)
         Material newMaterial{};
         newMaterial.baseColorTextureId = -1;
         newMaterial.emissiveTextureId = -1;
+        newMaterial.metallicRoughnessTextureId = -1;
+        newMaterial.emissiveColor = glm::vec3(0.0f);
         newMaterial.alphaMode = 0;
         newMaterial.alphaCutoff = 0.5f;
         newMaterial.doubleSided = 0;
@@ -661,6 +763,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             const auto& col = p["RGB"];
             newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+            newMaterial.emissiveColor = glm::vec3(0.0f);
             newMaterial.hasReflective = 0.f;
             newMaterial.hasRefractive = 0.f;
             newMaterial.emittance = 0.f;
@@ -670,6 +773,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             const auto& col = p["RGB"];
             newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+            newMaterial.emissiveColor = newMaterial.color;
             newMaterial.emittance = p["EMITTANCE"];
             newMaterial.hasReflective = 0.f;
             newMaterial.hasRefractive = 0.f;
@@ -781,8 +885,19 @@ void Scene::loadFromJSON(const std::string& jsonName)
     camera.position = glm::vec3(pos[0], pos[1], pos[2]);
     camera.lookAt = glm::vec3(lookat[0], lookat[1], lookat[2]);
     camera.up = glm::vec3(up[0], up[1], up[2]);
-    camera.apertureRadius = cameraData.contains("APERTURE") ? (float)cameraData["APERTURE"] : 0.0f;
-    camera.focalDistance = cameraData.contains("FOCALDIST") ? (float)cameraData["FOCALDIST"] : 0.0f;
+    camera.apertureRadius = cameraData.contains("APERTURE")
+        ? glm::max(0.0f, (float)cameraData["APERTURE"])
+        : 0.0f;
+    // A missing/invalid focal distance must not collapse the focal plane onto
+    // the camera.  Default to the look-at distance, which is the natural
+    // focus for a scene that enables depth of field without FOCALDIST.
+    const float lookAtDistance = glm::length(camera.lookAt - camera.position);
+    const float requestedFocalDistance = cameraData.contains("FOCALDIST")
+        ? (float)cameraData["FOCALDIST"]
+        : lookAtDistance;
+    camera.focalDistance = requestedFocalDistance > 1e-4f
+        ? requestedFocalDistance
+        : glm::max(1.0f, lookAtDistance);
 
     //calculate fov based on resolution
     float yscaled = tan(fovy * (PI / 180));

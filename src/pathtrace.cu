@@ -69,6 +69,16 @@ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int de
     return thrust::default_random_engine(h);
 }
 
+// Convert linear radiance to display-space sRGB before writing the 8-bit
+// preview buffer. The HDR accumulation buffer remains linear.
+__device__ __forceinline__ float linearToSrgb(float value)
+{
+    value = fminf(fmaxf(value, 0.0f), 1.0f);
+    return value <= 0.0031308f
+        ? 12.92f * value
+        : 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+}
+
 //Kernel that writes the image to the OpenGL PBO directly.
 __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm::vec3* image)
 {
@@ -81,9 +91,9 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
         glm::vec3 pix = image[index];
 
         glm::ivec3 color;
-        color.x = glm::clamp((int)(pix.x / iter * 255.0), 0, 255);
-        color.y = glm::clamp((int)(pix.y / iter * 255.0), 0, 255);
-        color.z = glm::clamp((int)(pix.z / iter * 255.0), 0, 255);
+        color.x = glm::clamp((int)(linearToSrgb(pix.x / iter) * 255.0f), 0, 255);
+        color.y = glm::clamp((int)(linearToSrgb(pix.y / iter) * 255.0f), 0, 255);
+        color.z = glm::clamp((int)(linearToSrgb(pix.z / iter) * 255.0f), 0, 255);
 
         // Each thread writes one pixel location in the texture (textel)
         pbo[index].w = 0;
@@ -383,7 +393,15 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
             glm::vec3 lensOffset = disk.x * cam.right + disk.y * cam.up;
             glm::vec3 lensOrigin = cam.position + lensOffset;
 
-            float focalT = cam.focalDistance / glm::dot(pinholeDir, cam.view);
+            float viewAlignment = glm::dot(pinholeDir, cam.view);
+            // Rays near the image-plane horizon have an ill-conditioned
+            // intersection with the focal plane.  Keep the focal distance
+            // finite and fall back to the configured distance in that case.
+            float focalT = cam.focalDistance;
+            if (fabsf(viewAlignment) > 1e-4f)
+            {
+                focalT = cam.focalDistance / viewAlignment;
+            }
             glm::vec3 hitFocalPoint = cam.position + pinholeDir * focalT;
 
             segment.ray.origin = lensOrigin;
@@ -760,8 +778,13 @@ const Material* materials, int num_paths, int* materialSortKeys)
     // rays hit are sorted by material types
     const Material m = materials[mid];
 
+    // Bucket by the shading path a ray will actually take. Only isLight
+    // materials terminate in the emissive branch; glTF emissive surfaces
+    // (emittance > 0 but isLight == 0) keep scattering, so they must be
+    // bucketed by their reflective/refractive/diffuse behaviour to keep the
+    // shading kernel memory-coherent.
     int bucket = BUCKET_DIFFUSE;
-    if(m.emittance > 0.0f)
+    if(m.isLight && m.emittance > 0.0f)
     {
         bucket = BUCKET_EMISSIVE;
     }
@@ -816,8 +839,14 @@ __device__ bool russianRouletteTerminate(
 }
 
 
+// Russian Roulette only kicks in after this many bounces. Killing paths from
+// the very first bounce adds variance without reducing the (already cheap)
+// early work, so we let every path take a few unconditional bounces first.
+#define RR_MIN_BOUNCES 3
+
 __global__ void shadeFakeMaterial(
     int iter,
+    int depth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
@@ -847,6 +876,7 @@ __global__ void shadeFakeMaterial(
 
             Material material = materials[intersection.materialId];
             glm::vec3 materialColor = material.color;
+            glm::vec3 emissionColor = material.emissiveColor;
             float materialAlpha = glm::clamp(material.baseAlpha, 0.0f, 1.0f);
 
             // Back-face handling for glTF doubleSided.
@@ -868,12 +898,43 @@ __global__ void shadeFakeMaterial(
                     float u = intersection.uv.x - floorf(intersection.uv.x);
                     float v = intersection.uv.y - floorf(intersection.uv.y);
                     int x = glm::clamp((int)(u * (w - 1)), 0, w - 1);
-                    int y = glm::clamp((int)((1.0f - v) * (h - 1)), 0, h - 1);
+                    // glTF defines (0, 0) at the image's upper-left corner.
+                    // stb_image also stores decoded rows top-to-bottom, so the
+                    // glTF t coordinate maps directly to the image row.
+                    int y = glm::clamp((int)(v * (h - 1)), 0, h - 1);
                     glm::vec3 texel = texturePixels[textureOffsets[tid] + y * w + x];
                     materialColor *= texel;
                     material.color = materialColor;
                     material.specular.color = glm::mix(glm::vec3(0.04f), materialColor,
                                                        glm::clamp(material.hasReflective, 0.0f, 1.0f));
+                }
+            }
+
+            // glTF metallic-roughness textures store roughness in G and
+            // metallic in B.  The scalar factors parsed from the material are
+            // multiplied by those channels, with the factors remaining the
+            // fallback when no texture is present.
+            if (material.metallicRoughnessTextureId >= 0 &&
+                material.metallicRoughnessTextureId < textureCount)
+            {
+                int tid = material.metallicRoughnessTextureId;
+                int w = textureWidths[tid];
+                int h = textureHeights[tid];
+                if (w > 0 && h > 0)
+                {
+                    float u = intersection.uv.x - floorf(intersection.uv.x);
+                    float v = intersection.uv.y - floorf(intersection.uv.y);
+                    int x = glm::clamp((int)(u * (w - 1)), 0, w - 1);
+                    // Keep the same glTF/stb_image top-left convention for
+                    // metallic-roughness textures as for base-color textures.
+                    int y = glm::clamp((int)(v * (h - 1)), 0, h - 1);
+                    glm::vec3 mrTexel = texturePixels[textureOffsets[tid] + y * w + x];
+                    material.hasReflective = glm::clamp(material.hasReflective * mrTexel.z, 0.0f, 1.0f);
+                    material.specular.exponent = glm::clamp(material.specular.exponent * mrTexel.y, 0.0f, 1.0f);
+                    material.specular.color = glm::mix(
+                        glm::vec3(0.04f),
+                        materialColor,
+                        material.hasReflective);
                 }
             }
 
@@ -914,9 +975,20 @@ __global__ void shadeFakeMaterial(
                     float u = intersection.uv.x - floorf(intersection.uv.x);
                     float v = intersection.uv.y - floorf(intersection.uv.y);
                     int x = glm::clamp((int)(u * (w - 1)), 0, w - 1);
-                    int y = glm::clamp((int)((1.0f - v) * (h - 1)), 0, h - 1);
-                    materialColor = texturePixels[textureOffsets[tid] + y * w + x];
+                    // glTF defines (0, 0) at the image's upper-left corner,
+                    // matching stb_image's top-to-bottom decoded row order.
+                    int y = glm::clamp((int)(v * (h - 1)), 0, h - 1);
+                    emissionColor *= texturePixels[textureOffsets[tid] + y * w + x];
                 }
+            }
+
+            // Keep emission independent from the base-color texture. JSON
+            // lights historically used their base color, so retain that
+            // fallback for any material without an explicit emission color.
+            if (material.isLight &&
+                glm::dot(emissionColor, emissionColor) <= 1e-12f)
+            {
+                emissionColor = materialColor;
             }
 
             // If the material indicates that the object was a light, "light" the ray
@@ -925,7 +997,7 @@ __global__ void shadeFakeMaterial(
             // emissive contribution is added below and the path continues with
             // diffuse / specular shading so the body still receives lighting.
             if (material.isLight && material.emittance > 0.0f) {
-                pathSegments[idx].color += pathSegments[idx].throughput * (materialColor * material.emittance);
+                pathSegments[idx].color += pathSegments[idx].throughput * (emissionColor * material.emittance);
                 pathSegments[idx].remainingBounces = 0;
                 return;
             }
@@ -934,7 +1006,7 @@ __global__ void shadeFakeMaterial(
                 // Non-terminating emissive contribution (e.g. glTF material
                 // with emissive texture). Add it to the radiance and continue
                 // scattering as usual so the surface still receives lighting.
-                pathSegments[idx].color += pathSegments[idx].throughput * (materialColor * material.emittance);
+                pathSegments[idx].color += pathSegments[idx].throughput * (emissionColor * material.emittance);
             }
 
             scatterRay(
@@ -950,7 +1022,8 @@ __global__ void shadeFakeMaterial(
             // kill paths whose throughput has become very small. The
             // throughput has already been re-weighted inside the helper to
             // keep the estimator unbiased.
-            if (russianRouletteTerminate(pathSegments[idx], rng, enableRussianRoulette))
+            if (depth > RR_MIN_BOUNCES &&
+                russianRouletteTerminate(pathSegments[idx], rng, enableRussianRoulette))
             {
                 pathSegments[idx].remainingBounces = 0;
             }
@@ -1001,7 +1074,6 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     const bool ENABLE_STREAM_COMPACTION = (guiData != NULL) ? guiData->enableStreamCompaction : true;
     const bool ENABLE_ADAPTIVE_COMPACTION = (guiData != NULL) ? guiData->enableAdaptiveCompaction : true;
     const bool ENABLE_MATERIAL_TYPE_SORT = (guiData != NULL) ? guiData->enableMaterialTypeSort : false;
-    const bool ENABLE_MESH_AABB_CULLING = (guiData != NULL) ? guiData->enableMeshAabbCulling : true;
     const bool ENABLE_MESH_BVH          = (guiData != NULL) ? guiData->enableMeshBvh : true;
     const bool ENABLE_RUSSIAN_ROULETTE  = (guiData != NULL) ? guiData->enableRussianRoulette : false;
     const float COMPACTION_ACTIVE_RATIO_THRESHOLD = (guiData != NULL) ? guiData->compactionActiveRatioThreshold : 0.70f;
@@ -1117,6 +1189,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
         shadeFakeMaterial<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
+            depth,
             num_paths,
             dev_intersections,
             dev_paths,

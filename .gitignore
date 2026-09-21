@@ -561,6 +561,5 @@ imgui.ini
 *.png
 .vscode
 INSTRUCTION_CHINESE.md
-scenes/Cube
-scenes/ToyCar
-scenes/mashroom-gltf
+FIXES.md
+CLAUDE.md

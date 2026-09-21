@@ -87,6 +87,11 @@ struct Material
     // Base color / albedo used for diffuse shading.
     glm::vec3 color;
 
+    // RGB emission color, kept separate from the base color.  glTF combines
+    // this with the optional emissive texture, while JSON "Emitting"
+    // materials use it as their light color.
+    glm::vec3 emissiveColor;
+
     // Specular (glossy) parameters. How you interpret these is up to your BSDF.
     struct
     {
@@ -110,6 +115,7 @@ struct Material
     // Texture indices into Scene::textures. -1 means no texture.
     int baseColorTextureId;
     int emissiveTextureId;
+    int metallicRoughnessTextureId;
 
     // glTF alpha and sidedness controls.
     // alphaMode: 0 = OPAQUE, 1 = MASK, 2 = BLEND.
