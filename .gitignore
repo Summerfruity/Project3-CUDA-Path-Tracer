@@ -558,7 +558,6 @@ xcuserdata
 *.moved-aside
 *.xcuserstate
 imgui.ini
-*.png
 .vscode
 INSTRUCTION_CHINESE.md
 FIXES.md
