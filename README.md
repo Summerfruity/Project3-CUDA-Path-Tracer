@@ -13,7 +13,7 @@ This project is a CUDA GPU path tracer for progressively rendering globally illu
 
 ![Damaged Helmet in a Cornell-style room](img/render_damaged_helmet.2026-09-21_04-41-59z.8008samp.png)
 
-*Representative result: the Damaged Helmet glTF scene at 800x800. The filename records 8008 samples at the time this image was saved; it is an existing repository artifact, not a render produced during this README pass.*
+*Representative result: the Damaged Helmet glTF scene at 800x800.*
 
 ## Overview
 
@@ -176,7 +176,7 @@ Six runnable glTF scenes are provided in `scenes/`, with their models in `scenes
 | `render_fox.json` | `Fox.glb` | 5120, 8 |
 | `render_lantern.json` | `Lantern.glb` | 5120, 8 |
 
-The older `scenes/render_gltf.json` still references the missing `ToyCar/glTF/ToyCar.gltf`. It is retained as a historical file, but it should not be used as the default glTF example; use one of the six scenes above instead.
+
 
 ## Build
 
@@ -261,7 +261,6 @@ The optimization switches are deliberately runtime-configurable so they can be c
 | Mesh BVH on/off | Replaces per-triangle iteration with TLAS plus per-mesh traversal | Mesh ranges substantially larger than 16 triangles |
 | Russian roulette on/off | Reduces late work with unbiased reweighting, at the cost of variance | Closed scenes and larger `DEPTH` values |
 
-Any report should state GPU model, driver/CUDA versions, build configuration, resolution, iteration count, trace depth, and toggle state. Graph axes need units and a clear lower-is-better label for timing plots. `img/stacked_bar_graph.png` is an unrelated espresso example image and is intentionally not presented as project performance data.
 
 ## Known Limitations
 
@@ -274,15 +273,6 @@ Any report should state GPU model, driver/CUDA versions, build configuration, re
 - Preview and PNG output apply linear-to-sRGB conversion and clipping, but no filmic tone mapping or denoising.
 - There is no automated unit-test or benchmark target; a CUDA-capable GPU and an OpenGL desktop context are runtime requirements.
 
-## Verification Record
-
-This README update used a no-render static verification boundary:
-
-- `JSON.parse` succeeded for `scenes/cornell.json`, `scenes/sphere.json`, and all six new `render_*.json` files;
-- all six new glTF `PATH` targets exist;
-- all six GLB files have the `glTF` magic, version 2, and a declared length matching the actual file length;
-- `git diff --check` reported no whitespace errors;
-- no new `cmake --build`, interactive preview, or timing benchmark was run. The existing `build/bin/Release/cis565_path_tracer.exe` is not treated as fresh build evidence.
 
 ## Repository Layout
 
